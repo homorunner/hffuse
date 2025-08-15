@@ -3,21 +3,21 @@
  * Copyright (C) 2017 Red Hat, Inc.
  */
 
-#include "fuse_i.h"
+#include "hffuse_i.h"
 
 #include <linux/uio.h>
 #include <linux/compat.h>
 #include <linux/fileattr.h>
 
-static ssize_t fuse_send_ioctl(struct fuse_mount *fm, struct fuse_args *args,
-			       struct fuse_ioctl_out *outarg)
+static ssize_t hffuse_send_ioctl(struct hffuse_mount *fm, struct hffuse_args *args,
+			       struct hffuse_ioctl_out *outarg)
 {
 	ssize_t ret;
 
 	args->out_args[0].size = sizeof(*outarg);
 	args->out_args[0].value = outarg;
 
-	ret = fuse_simple_request(fm, args);
+	ret = hffuse_simple_request(fm, args);
 
 	/* Translate ENOSYS, which shouldn't be returned from fs */
 	if (ret == -ENOSYS)
@@ -35,7 +35,7 @@ static ssize_t fuse_send_ioctl(struct fuse_mount *fm, struct fuse_args *args,
  * and 64bit.  Fortunately we can determine which structure the server
  * used from the size of the reply.
  */
-static int fuse_copy_ioctl_iovec_old(struct iovec *dst, void *src,
+static int hffuse_copy_ioctl_iovec_old(struct iovec *dst, void *src,
 				     size_t transferred, unsigned count,
 				     bool is_compat)
 {
@@ -68,7 +68,7 @@ static int fuse_copy_ioctl_iovec_old(struct iovec *dst, void *src,
 }
 
 /* Make sure iov_length() won't overflow */
-static int fuse_verify_ioctl_iov(struct fuse_conn *fc, struct iovec *iov,
+static int hffuse_verify_ioctl_iov(struct hffuse_conn *fc, struct iovec *iov,
 				 size_t count)
 {
 	size_t n;
@@ -82,19 +82,19 @@ static int fuse_verify_ioctl_iov(struct fuse_conn *fc, struct iovec *iov,
 	return 0;
 }
 
-static int fuse_copy_ioctl_iovec(struct fuse_conn *fc, struct iovec *dst,
+static int hffuse_copy_ioctl_iovec(struct hffuse_conn *fc, struct iovec *dst,
 				 void *src, size_t transferred, unsigned count,
 				 bool is_compat)
 {
 	unsigned i;
-	struct fuse_ioctl_iovec *fiov = src;
+	struct hffuse_ioctl_iovec *fiov = src;
 
 	if (fc->minor < 16) {
-		return fuse_copy_ioctl_iovec_old(dst, src, transferred,
+		return hffuse_copy_ioctl_iovec_old(dst, src, transferred,
 						 count, is_compat);
 	}
 
-	if (count * sizeof(struct fuse_ioctl_iovec) != transferred)
+	if (count * sizeof(struct hffuse_ioctl_iovec) != transferred)
 		return -EIO;
 
 	for (i = 0; i < count; i++) {
@@ -122,10 +122,10 @@ static int fuse_copy_ioctl_iovec(struct fuse_conn *fc, struct iovec *dst,
  * For ioctls, there is no generic way to determine how much memory
  * needs to be read and/or written.  Furthermore, ioctls are allowed
  * to dereference the passed pointer, so the parameter requires deep
- * copying but FUSE has no idea whatsoever about what to copy in or
+ * copying but HFFUSE has no idea whatsoever about what to copy in or
  * out.
  *
- * This is solved by allowing FUSE server to retry ioctl with
+ * This is solved by allowing HFFUSE server to retry ioctl with
  * necessary in/out iovecs.  Let's assume the ioctl implementation
  * needs to read in the following structure.
  *
@@ -134,48 +134,48 @@ static int fuse_copy_ioctl_iovec(struct fuse_conn *fc, struct iovec *dst,
  *	size_t	buflen;
  * }
  *
- * On the first callout to FUSE server, inarg->in_size and
+ * On the first callout to HFFUSE server, inarg->in_size and
  * inarg->out_size will be NULL; then, the server completes the ioctl
- * with FUSE_IOCTL_RETRY set in out->flags, out->in_iovs set to 1 and
+ * with HFFUSE_IOCTL_RETRY set in out->flags, out->in_iovs set to 1 and
  * the actual iov array to
  *
  * { { .iov_base = inarg.arg,	.iov_len = sizeof(struct a) } }
  *
- * which tells FUSE to copy in the requested area and retry the ioctl.
+ * which tells HFFUSE to copy in the requested area and retry the ioctl.
  * On the second round, the server has access to the structure and
  * from that it can tell what to look for next, so on the invocation,
- * it sets FUSE_IOCTL_RETRY, out->in_iovs to 2 and iov array to
+ * it sets HFFUSE_IOCTL_RETRY, out->in_iovs to 2 and iov array to
  *
  * { { .iov_base = inarg.arg,	.iov_len = sizeof(struct a)	},
  *   { .iov_base = a.buf,	.iov_len = a.buflen		} }
  *
- * FUSE will copy both struct a and the pointed buffer from the
+ * HFFUSE will copy both struct a and the pointed buffer from the
  * process doing the ioctl and retry ioctl with both struct a and the
  * buffer.
  *
- * This time, FUSE server has everything it needs and completes ioctl
- * without FUSE_IOCTL_RETRY which finishes the ioctl call.
+ * This time, HFFUSE server has everything it needs and completes ioctl
+ * without HFFUSE_IOCTL_RETRY which finishes the ioctl call.
  *
  * Copying data out works the same way.
  *
- * Note that if FUSE_IOCTL_UNRESTRICTED is clear, the kernel
+ * Note that if HFFUSE_IOCTL_UNRESTRICTED is clear, the kernel
  * automatically initializes in and out iovs by decoding @cmd with
  * _IOC_* macros and the server is not allowed to request RETRY.  This
  * limits ioctl data transfers to well-formed ioctls and is the forced
- * behavior for all FUSE servers.
+ * behavior for all HFFUSE servers.
  */
-long fuse_do_ioctl(struct file *file, unsigned int cmd, unsigned long arg,
+long hffuse_do_ioctl(struct file *file, unsigned int cmd, unsigned long arg,
 		   unsigned int flags)
 {
-	struct fuse_file *ff = file->private_data;
-	struct fuse_mount *fm = ff->fm;
-	struct fuse_ioctl_in inarg = {
+	struct hffuse_file *ff = file->private_data;
+	struct hffuse_mount *fm = ff->fm;
+	struct hffuse_ioctl_in inarg = {
 		.fh = ff->fh,
 		.cmd = cmd,
 		.arg = arg,
 		.flags = flags
 	};
-	struct fuse_ioctl_out outarg;
+	struct hffuse_ioctl_out outarg;
 	struct iovec *iov_page = NULL;
 	struct iovec *in_iov = NULL, *out_iov = NULL;
 	unsigned int in_iovs = 0, out_iovs = 0, max_pages;
@@ -183,36 +183,36 @@ long fuse_do_ioctl(struct file *file, unsigned int cmd, unsigned long arg,
 	ssize_t transferred;
 	int err, i;
 	struct iov_iter ii;
-	struct fuse_args_pages ap = {};
+	struct hffuse_args_pages ap = {};
 
 #if BITS_PER_LONG == 32
-	inarg.flags |= FUSE_IOCTL_32BIT;
+	inarg.flags |= HFFUSE_IOCTL_32BIT;
 #else
-	if (flags & FUSE_IOCTL_COMPAT) {
-		inarg.flags |= FUSE_IOCTL_32BIT;
+	if (flags & HFFUSE_IOCTL_COMPAT) {
+		inarg.flags |= HFFUSE_IOCTL_32BIT;
 #ifdef CONFIG_X86_X32_ABI
 		if (in_x32_syscall())
-			inarg.flags |= FUSE_IOCTL_COMPAT_X32;
+			inarg.flags |= HFFUSE_IOCTL_COMPAT_X32;
 #endif
 	}
 #endif
 
 	/* assume all the iovs returned by client always fits in a page */
-	BUILD_BUG_ON(sizeof(struct fuse_ioctl_iovec) * FUSE_IOCTL_MAX_IOV > PAGE_SIZE);
+	BUILD_BUG_ON(sizeof(struct hffuse_ioctl_iovec) * HFFUSE_IOCTL_MAX_IOV > PAGE_SIZE);
 
 	err = -ENOMEM;
-	ap.pages = fuse_pages_alloc(fm->fc->max_pages, GFP_KERNEL, &ap.descs);
+	ap.pages = hffuse_pages_alloc(fm->fc->max_pages, GFP_KERNEL, &ap.descs);
 	iov_page = (struct iovec *) __get_free_page(GFP_KERNEL);
 	if (!ap.pages || !iov_page)
 		goto out;
 
-	fuse_page_descs_length_init(ap.descs, 0, fm->fc->max_pages);
+	hffuse_page_descs_length_init(ap.descs, 0, fm->fc->max_pages);
 
 	/*
 	 * If restricted, initialize IO parameters as encoded in @cmd.
 	 * RETRY from server is not allowed.
 	 */
-	if (!(flags & FUSE_IOCTL_UNRESTRICTED)) {
+	if (!(flags & HFFUSE_IOCTL_UNRESTRICTED)) {
 		struct iovec *iov = iov_page;
 
 		iov->iov_base = (void __user *)arg;
@@ -253,7 +253,7 @@ long fuse_do_ioctl(struct file *file, unsigned int cmd, unsigned long arg,
 
 
 	/* okay, let's send it to the client */
-	ap.args.opcode = FUSE_IOCTL;
+	ap.args.opcode = HFFUSE_IOCTL;
 	ap.args.nodeid = ff->nodeid;
 	ap.args.in_numargs = 1;
 	ap.args.in_args[0].size = sizeof(inarg);
@@ -277,18 +277,18 @@ long fuse_do_ioctl(struct file *file, unsigned int cmd, unsigned long arg,
 	ap.args.out_pages = true;
 	ap.args.out_argvar = true;
 
-	transferred = fuse_send_ioctl(fm, &ap.args, &outarg);
+	transferred = hffuse_send_ioctl(fm, &ap.args, &outarg);
 	err = transferred;
 	if (transferred < 0)
 		goto out;
 
 	/* did it ask for retry? */
-	if (outarg.flags & FUSE_IOCTL_RETRY) {
+	if (outarg.flags & HFFUSE_IOCTL_RETRY) {
 		void *vaddr;
 
 		/* no retry if in restricted mode */
 		err = -EIO;
-		if (!(flags & FUSE_IOCTL_UNRESTRICTED))
+		if (!(flags & HFFUSE_IOCTL_UNRESTRICTED))
 			goto out;
 
 		in_iovs = outarg.in_iovs;
@@ -299,15 +299,15 @@ long fuse_do_ioctl(struct file *file, unsigned int cmd, unsigned long arg,
 		 * are to protect against overflow.
 		 */
 		err = -ENOMEM;
-		if (in_iovs > FUSE_IOCTL_MAX_IOV ||
-		    out_iovs > FUSE_IOCTL_MAX_IOV ||
-		    in_iovs + out_iovs > FUSE_IOCTL_MAX_IOV)
+		if (in_iovs > HFFUSE_IOCTL_MAX_IOV ||
+		    out_iovs > HFFUSE_IOCTL_MAX_IOV ||
+		    in_iovs + out_iovs > HFFUSE_IOCTL_MAX_IOV)
 			goto out;
 
 		vaddr = kmap_local_page(ap.pages[0]);
-		err = fuse_copy_ioctl_iovec(fm->fc, iov_page, vaddr,
+		err = hffuse_copy_ioctl_iovec(fm->fc, iov_page, vaddr,
 					    transferred, in_iovs + out_iovs,
-					    (flags & FUSE_IOCTL_COMPAT) != 0);
+					    (flags & HFFUSE_IOCTL_COMPAT) != 0);
 		kunmap_local(vaddr);
 		if (err)
 			goto out;
@@ -315,11 +315,11 @@ long fuse_do_ioctl(struct file *file, unsigned int cmd, unsigned long arg,
 		in_iov = iov_page;
 		out_iov = in_iov + in_iovs;
 
-		err = fuse_verify_ioctl_iov(fm->fc, in_iov, in_iovs);
+		err = hffuse_verify_ioctl_iov(fm->fc, in_iov, in_iovs);
 		if (err)
 			goto out;
 
-		err = fuse_verify_ioctl_iov(fm->fc, out_iov, out_iovs);
+		err = hffuse_verify_ioctl_iov(fm->fc, out_iov, out_iovs);
 		if (err)
 			goto out;
 
@@ -346,41 +346,41 @@ long fuse_do_ioctl(struct file *file, unsigned int cmd, unsigned long arg,
 
 	return err ? err : outarg.result;
 }
-EXPORT_SYMBOL_GPL(fuse_do_ioctl);
+EXPORT_SYMBOL_GPL(hffuse_do_ioctl);
 
-long fuse_ioctl_common(struct file *file, unsigned int cmd,
+long hffuse_ioctl_common(struct file *file, unsigned int cmd,
 		       unsigned long arg, unsigned int flags)
 {
 	struct inode *inode = file_inode(file);
-	struct fuse_conn *fc = get_fuse_conn(inode);
+	struct hffuse_conn *fc = get_hffuse_conn(inode);
 
-	if (!fuse_allow_current_process(fc))
+	if (!hffuse_allow_current_process(fc))
 		return -EACCES;
 
-	if (fuse_is_bad(inode))
+	if (hffuse_is_bad(inode))
 		return -EIO;
 
-	return fuse_do_ioctl(file, cmd, arg, flags);
+	return hffuse_do_ioctl(file, cmd, arg, flags);
 }
 
-long fuse_file_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+long hffuse_file_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
-	return fuse_ioctl_common(file, cmd, arg, 0);
+	return hffuse_ioctl_common(file, cmd, arg, 0);
 }
 
-long fuse_file_compat_ioctl(struct file *file, unsigned int cmd,
+long hffuse_file_compat_ioctl(struct file *file, unsigned int cmd,
 			    unsigned long arg)
 {
-	return fuse_ioctl_common(file, cmd, arg, FUSE_IOCTL_COMPAT);
+	return hffuse_ioctl_common(file, cmd, arg, HFFUSE_IOCTL_COMPAT);
 }
 
-static int fuse_priv_ioctl(struct inode *inode, struct fuse_file *ff,
+static int hffuse_priv_ioctl(struct inode *inode, struct hffuse_file *ff,
 			   unsigned int cmd, void *ptr, size_t size)
 {
-	struct fuse_mount *fm = ff->fm;
-	struct fuse_ioctl_in inarg;
-	struct fuse_ioctl_out outarg;
-	FUSE_ARGS(args);
+	struct hffuse_mount *fm = ff->fm;
+	struct hffuse_ioctl_in inarg;
+	struct hffuse_ioctl_out outarg;
+	HFFUSE_ARGS(args);
 	int err;
 
 	memset(&inarg, 0, sizeof(inarg));
@@ -388,17 +388,17 @@ static int fuse_priv_ioctl(struct inode *inode, struct fuse_file *ff,
 	inarg.cmd = cmd;
 
 #if BITS_PER_LONG == 32
-	inarg.flags |= FUSE_IOCTL_32BIT;
+	inarg.flags |= HFFUSE_IOCTL_32BIT;
 #endif
 	if (S_ISDIR(inode->i_mode))
-		inarg.flags |= FUSE_IOCTL_DIR;
+		inarg.flags |= HFFUSE_IOCTL_DIR;
 
 	if (_IOC_DIR(cmd) & _IOC_READ)
 		inarg.out_size = size;
 	if (_IOC_DIR(cmd) & _IOC_WRITE)
 		inarg.in_size = size;
 
-	args.opcode = FUSE_IOCTL;
+	args.opcode = HFFUSE_IOCTL;
 	args.nodeid = ff->nodeid;
 	args.in_numargs = 2;
 	args.in_args[0].size = sizeof(inarg);
@@ -409,59 +409,59 @@ static int fuse_priv_ioctl(struct inode *inode, struct fuse_file *ff,
 	args.out_args[1].size = inarg.out_size;
 	args.out_args[1].value = ptr;
 
-	err = fuse_send_ioctl(fm, &args, &outarg);
+	err = hffuse_send_ioctl(fm, &args, &outarg);
 	if (!err) {
 		if (outarg.result < 0)
 			err = outarg.result;
-		else if (outarg.flags & FUSE_IOCTL_RETRY)
+		else if (outarg.flags & HFFUSE_IOCTL_RETRY)
 			err = -EIO;
 	}
 	return err;
 }
 
-static struct fuse_file *fuse_priv_ioctl_prepare(struct inode *inode)
+static struct hffuse_file *hffuse_priv_ioctl_prepare(struct inode *inode)
 {
-	struct fuse_mount *fm = get_fuse_mount(inode);
+	struct hffuse_mount *fm = get_hffuse_mount(inode);
 	bool isdir = S_ISDIR(inode->i_mode);
 
-	if (!fuse_allow_current_process(fm->fc))
+	if (!hffuse_allow_current_process(fm->fc))
 		return ERR_PTR(-EACCES);
 
-	if (fuse_is_bad(inode))
+	if (hffuse_is_bad(inode))
 		return ERR_PTR(-EIO);
 
 	if (!S_ISREG(inode->i_mode) && !isdir)
 		return ERR_PTR(-ENOTTY);
 
-	return fuse_file_open(fm, get_node_id(inode), O_RDONLY, isdir);
+	return hffuse_file_open(fm, get_node_id(inode), O_RDONLY, isdir);
 }
 
-static void fuse_priv_ioctl_cleanup(struct inode *inode, struct fuse_file *ff)
+static void hffuse_priv_ioctl_cleanup(struct inode *inode, struct hffuse_file *ff)
 {
-	fuse_file_release(inode, ff, O_RDONLY, NULL, S_ISDIR(inode->i_mode));
+	hffuse_file_release(inode, ff, O_RDONLY, NULL, S_ISDIR(inode->i_mode));
 }
 
-int fuse_fileattr_get(struct dentry *dentry, struct fileattr *fa)
+int hffuse_fileattr_get(struct dentry *dentry, struct fileattr *fa)
 {
 	struct inode *inode = d_inode(dentry);
-	struct fuse_file *ff;
+	struct hffuse_file *ff;
 	unsigned int flags;
 	struct fsxattr xfa;
 	int err;
 
-	ff = fuse_priv_ioctl_prepare(inode);
+	ff = hffuse_priv_ioctl_prepare(inode);
 	if (IS_ERR(ff))
 		return PTR_ERR(ff);
 
 	if (fa->flags_valid) {
-		err = fuse_priv_ioctl(inode, ff, FS_IOC_GETFLAGS,
+		err = hffuse_priv_ioctl(inode, ff, FS_IOC_GETFLAGS,
 				      &flags, sizeof(flags));
 		if (err)
 			goto cleanup;
 
 		fileattr_fill_flags(fa, flags);
 	} else {
-		err = fuse_priv_ioctl(inode, ff, FS_IOC_FSGETXATTR,
+		err = hffuse_priv_ioctl(inode, ff, FS_IOC_FSGETXATTR,
 				      &xfa, sizeof(xfa));
 		if (err)
 			goto cleanup;
@@ -473,26 +473,26 @@ int fuse_fileattr_get(struct dentry *dentry, struct fileattr *fa)
 		fa->fsx_cowextsize = xfa.fsx_cowextsize;
 	}
 cleanup:
-	fuse_priv_ioctl_cleanup(inode, ff);
+	hffuse_priv_ioctl_cleanup(inode, ff);
 
 	return err;
 }
 
-int fuse_fileattr_set(struct mnt_idmap *idmap,
+int hffuse_fileattr_set(struct mnt_idmap *idmap,
 		      struct dentry *dentry, struct fileattr *fa)
 {
 	struct inode *inode = d_inode(dentry);
-	struct fuse_file *ff;
+	struct hffuse_file *ff;
 	unsigned int flags = fa->flags;
 	struct fsxattr xfa;
 	int err;
 
-	ff = fuse_priv_ioctl_prepare(inode);
+	ff = hffuse_priv_ioctl_prepare(inode);
 	if (IS_ERR(ff))
 		return PTR_ERR(ff);
 
 	if (fa->flags_valid) {
-		err = fuse_priv_ioctl(inode, ff, FS_IOC_SETFLAGS,
+		err = hffuse_priv_ioctl(inode, ff, FS_IOC_SETFLAGS,
 				      &flags, sizeof(flags));
 		if (err)
 			goto cleanup;
@@ -504,12 +504,12 @@ int fuse_fileattr_set(struct mnt_idmap *idmap,
 		xfa.fsx_projid = fa->fsx_projid;
 		xfa.fsx_cowextsize = fa->fsx_cowextsize;
 
-		err = fuse_priv_ioctl(inode, ff, FS_IOC_FSSETXATTR,
+		err = hffuse_priv_ioctl(inode, ff, FS_IOC_FSSETXATTR,
 				      &xfa, sizeof(xfa));
 	}
 
 cleanup:
-	fuse_priv_ioctl_cleanup(inode, ff);
+	hffuse_priv_ioctl_cleanup(inode, ff);
 
 	return err;
 }
