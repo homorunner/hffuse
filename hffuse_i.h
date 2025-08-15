@@ -33,10 +33,10 @@
 #include <linux/user_namespace.h>
 
 /** Default max number of pages that can be used in a single read request */
-#define HFFUSE_DEFAULT_MAX_PAGES_PER_REQ 32
+#define HFFUSE_DEFAULT_MAX_PAGES_PER_REQ 4096
 
 /** Maximum of max_pages received in init_out */
-#define HFFUSE_MAX_MAX_PAGES 256
+#define HFFUSE_MAX_MAX_PAGES 4096
 
 /** Bias for fi->writectr, meaning new writepages must not be sent */
 #define HFFUSE_NOWRITE INT_MIN

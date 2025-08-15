@@ -1153,4 +1153,6 @@ struct hffuse_supp_groups {
 	uint32_t	groups[];
 };
 
+#define HFFUSE_MINOR 251
+
 #endif /* _LINUX_HFFUSE_H */

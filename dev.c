@@ -22,7 +22,7 @@
 #include <linux/splice.h>
 #include <linux/sched.h>
 
-MODULE_ALIAS_MISCDEV(FUSE_MINOR);
+MODULE_ALIAS_MISCDEV(HFFUSE_MINOR);
 MODULE_ALIAS("devname:hffuse");
 
 /* Ordinary requests have even IDs, while interrupts IDs are odd */
@@ -2306,7 +2306,7 @@ const struct file_operations hffuse_dev_operations = {
 EXPORT_SYMBOL_GPL(hffuse_dev_operations);
 
 static struct miscdevice hffuse_miscdevice = {
-	.minor = FUSE_MINOR,
+	.minor = HFFUSE_MINOR,
 	.name  = "hffuse",
 	.fops = &hffuse_dev_operations,
 };
