@@ -54,7 +54,7 @@ MODULE_PARM_DESC(max_user_congthresh,
 #define HFFUSE_DEFAULT_BLKSIZE 512
 
 /** Maximum number of outstanding background requests */
-#define HFFUSE_DEFAULT_MAX_BACKGROUND 12
+#define HFFUSE_DEFAULT_MAX_BACKGROUND 256
 
 /** Congestion starts at 75% of maximum */
 #define HFFUSE_DEFAULT_CONGESTION_THRESHOLD (HFFUSE_DEFAULT_MAX_BACKGROUND * 3 / 4)
