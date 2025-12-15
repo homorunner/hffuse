@@ -120,7 +120,7 @@ static bool hffuse_emit(struct file *file, struct dir_context *ctx,
 		hffuse_add_dirent_to_cache(file, dirent, ctx->pos);
 
 	return dir_emit(ctx, dirent->name, dirent->namelen, dirent->ino,
-			dirent->type);
+			dirent->type | FILLDIR_FLAG_NOINTR);
 }
 
 static int parse_dirfile(char *buf, size_t nbytes, struct file *file,
@@ -149,7 +149,7 @@ static int parse_dirfile(char *buf, size_t nbytes, struct file *file,
 
 static int hffuse_direntplus_link(struct file *file,
 				struct hffuse_direntplus *direntplus,
-				u64 attr_version)
+				u64 attr_version, u64 evict_ctr)
 {
 	struct hffuse_entry_out *o = &direntplus->entry_out;
 	struct hffuse_dirent *dirent = &direntplus->dirent;
@@ -161,6 +161,7 @@ static int hffuse_direntplus_link(struct file *file,
 	struct hffuse_conn *fc;
 	struct inode *inode;
 	DECLARE_WAIT_QUEUE_HEAD_ONSTACK(wq);
+	int epoch;
 
 	if (!o->nodeid) {
 		/*
@@ -190,6 +191,7 @@ static int hffuse_direntplus_link(struct file *file,
 		return -EIO;
 
 	fc = get_hffuse_conn(dir);
+	epoch = atomic_read(&fc->epoch);
 
 	name.hash = full_name_hash(parent, name.name, name.len);
 	dentry = d_lookup(parent, &name);
@@ -233,7 +235,7 @@ retry:
 	} else {
 		inode = hffuse_iget(dir->i_sb, o->nodeid, o->generation,
 				  &o->attr, ATTR_TIMEOUT(o),
-				  attr_version);
+				  attr_version, evict_ctr);
 		if (!inode)
 			inode = ERR_PTR(-ENOMEM);
 
@@ -256,6 +258,7 @@ retry:
 	}
 	if (fc->readdirplus_auto)
 		set_bit(HFFUSE_I_INIT_RDPLUS, &get_hffuse_inode(inode)->state);
+	dentry->d_time = epoch;
 	hffuse_change_entry_timeout(dentry, o);
 
 	dput(dentry);
@@ -284,7 +287,8 @@ static void hffuse_force_forget(struct file *file, u64 nodeid)
 }
 
 static int parse_dirplusfile(char *buf, size_t nbytes, struct file *file,
-			     struct dir_context *ctx, u64 attr_version)
+			     struct dir_context *ctx, u64 attr_version,
+			     u64 evict_ctr)
 {
 	struct hffuse_direntplus *direntplus;
 	struct hffuse_dirent *dirent;
@@ -319,7 +323,7 @@ static int parse_dirplusfile(char *buf, size_t nbytes, struct file *file,
 		buf += reclen;
 		nbytes -= reclen;
 
-		ret = hffuse_direntplus_link(file, direntplus, attr_version);
+		ret = hffuse_direntplus_link(file, direntplus, attr_version, evict_ctr);
 		if (ret)
 			hffuse_force_forget(file, direntplus->entry_out.nodeid);
 	}
@@ -331,34 +335,32 @@ static int hffuse_readdir_uncached(struct file *file, struct dir_context *ctx)
 {
 	int plus;
 	ssize_t res;
-	struct page *page;
 	struct inode *inode = file_inode(file);
 	struct hffuse_mount *fm = get_hffuse_mount(inode);
+	struct hffuse_conn *fc = fm->fc;
 	struct hffuse_io_args ia = {};
-	struct hffuse_args_pages *ap = &ia.ap;
-	struct hffuse_page_desc desc = { .length = PAGE_SIZE };
-	u64 attr_version = 0;
+	struct hffuse_args *args = &ia.ap.args;
+	void *buf;
+	size_t bufsize = clamp((unsigned int) ctx->count, PAGE_SIZE, fc->max_pages << PAGE_SHIFT);
+	u64 attr_version = 0, evict_ctr = 0;
 	bool locked;
 
-	page = alloc_page(GFP_KERNEL);
-	if (!page)
+	buf = kvmalloc(bufsize, GFP_KERNEL);
+	if (!buf)
 		return -ENOMEM;
 
+	args->out_args[0].value = buf;
+
 	plus = hffuse_use_readdirplus(inode, ctx);
-	ap->args.out_pages = true;
-	ap->num_pages = 1;
-	ap->pages = &page;
-	ap->descs = &desc;
 	if (plus) {
 		attr_version = hffuse_get_attr_version(fm->fc);
-		hffuse_read_args_fill(&ia, file, ctx->pos, PAGE_SIZE,
-				    HFFUSE_READDIRPLUS);
+		evict_ctr = hffuse_get_evict_ctr(fm->fc);
+		hffuse_read_args_fill(&ia, file, ctx->pos, bufsize, HFFUSE_READDIRPLUS);
 	} else {
-		hffuse_read_args_fill(&ia, file, ctx->pos, PAGE_SIZE,
-				    HFFUSE_READDIR);
+		hffuse_read_args_fill(&ia, file, ctx->pos, bufsize, HFFUSE_READDIR);
 	}
 	locked = hffuse_lock_inode(inode);
-	res = hffuse_simple_request(fm, &ap->args);
+	res = hffuse_simple_request(fm, args);
 	hffuse_unlock_inode(inode, locked);
 	if (res >= 0) {
 		if (!res) {
@@ -367,15 +369,14 @@ static int hffuse_readdir_uncached(struct file *file, struct dir_context *ctx)
 			if (ff->open_flags & FOPEN_CACHE_DIR)
 				hffuse_readdir_cache_end(file, ctx->pos);
 		} else if (plus) {
-			res = parse_dirplusfile(page_address(page), res,
-						file, ctx, attr_version);
+			res = parse_dirplusfile(buf, res, file, ctx, attr_version,
+						evict_ctr);
 		} else {
-			res = parse_dirfile(page_address(page), res, file,
-					    ctx);
+			res = parse_dirfile(buf, res, file, ctx);
 		}
 	}
 
-	__free_page(page);
+	kvfree(buf);
 	hffuse_invalidate_atime(inode);
 	return res;
 }
@@ -416,7 +417,7 @@ static enum hffuse_parse_result hffuse_parse_cache(struct hffuse_file *ff,
 		if (ff->readdir.pos == ctx->pos) {
 			res = FOUND_SOME;
 			if (!dir_emit(ctx, dirent->name, dirent->namelen,
-				      dirent->ino, dirent->type))
+				      dirent->ino, dirent->type | FILLDIR_FLAG_NOINTR))
 				return FOUND_ALL;
 			ctx->pos = dirent->off;
 		}
@@ -592,15 +593,11 @@ int hffuse_readdir(struct file *file, struct dir_context *ctx)
 	if (hffuse_is_bad(inode))
 		return -EIO;
 
-	mutex_lock(&ff->readdir.lock);
-
 	err = UNCACHED;
 	if (ff->open_flags & FOPEN_CACHE_DIR)
 		err = hffuse_readdir_cached(file, ctx);
 	if (err == UNCACHED)
 		err = hffuse_readdir_uncached(file, ctx);
-
-	mutex_unlock(&ff->readdir.lock);
 
 	return err;
 }

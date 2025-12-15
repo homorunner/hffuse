@@ -175,9 +175,12 @@ static void hffuse_lookup_init(struct hffuse_conn *fc, struct hffuse_args *args,
 	memset(outarg, 0, sizeof(struct hffuse_entry_out));
 	args->opcode = HFFUSE_LOOKUP;
 	args->nodeid = nodeid;
-	args->in_numargs = 1;
-	args->in_args[0].size = name->len + 1;
-	args->in_args[0].value = name->name;
+	args->in_numargs = 3;
+	hffuse_set_zero_arg0(args);
+	args->in_args[1].size = name->len;
+	args->in_args[1].value = name->name;
+	args->in_args[2].size = 1;
+	args->in_args[2].value = "";
 	args->out_numargs = 1;
 	args->out_args[0].size = sizeof(struct hffuse_entry_out);
 	args->out_args[0].value = outarg;
@@ -192,13 +195,18 @@ static void hffuse_lookup_init(struct hffuse_conn *fc, struct hffuse_args *args,
  * the lookup once more.  If the lookup results in the same inode,
  * then refresh the attributes, timeouts and mark the dentry valid.
  */
-static int hffuse_dentry_revalidate(struct dentry *entry, unsigned int flags)
+static int hffuse_dentry_revalidate(struct inode *dir, const struct qstr *name,
+				  struct dentry *entry, unsigned int flags)
 {
 	struct inode *inode;
-	struct dentry *parent;
 	struct hffuse_mount *fm;
+	struct hffuse_conn *fc;
 	struct hffuse_inode *fi;
 	int ret;
+
+	fc = get_hffuse_conn_super(dir->i_sb);
+	if (entry->d_time < atomic_read(&fc->epoch))
+		goto invalid;
 
 	inode = d_inode_rcu(entry);
 	if (inode && hffuse_is_bad(inode))
@@ -227,11 +235,9 @@ static int hffuse_dentry_revalidate(struct dentry *entry, unsigned int flags)
 
 		attr_version = hffuse_get_attr_version(fm->fc);
 
-		parent = dget_parent(entry);
-		hffuse_lookup_init(fm->fc, &args, get_node_id(d_inode(parent)),
-				 &entry->d_name, &outarg);
+		hffuse_lookup_init(fm->fc, &args, get_node_id(dir),
+				 name, &outarg);
 		ret = hffuse_simple_request(fm, &args);
-		dput(parent);
 		/* Zero nodeid is same as -ENOENT */
 		if (!ret && !outarg.nodeid)
 			ret = -ENOENT;
@@ -265,9 +271,7 @@ static int hffuse_dentry_revalidate(struct dentry *entry, unsigned int flags)
 			if (test_bit(HFFUSE_I_INIT_RDPLUS, &fi->state))
 				return -ECHILD;
 		} else if (test_and_clear_bit(HFFUSE_I_INIT_RDPLUS, &fi->state)) {
-			parent = dget_parent(entry);
-			hffuse_advise_use_readdirplus(d_inode(parent));
-			dput(parent);
+			hffuse_advise_use_readdirplus(dir);
 		}
 	}
 	ret = 1;
@@ -320,9 +324,6 @@ static struct vfsmount *hffuse_dentry_automount(struct path *path)
 
 	/* Create the submount */
 	mnt = fc_mount(fsc);
-	if (!IS_ERR(mnt))
-		mntget(mnt);
-
 	put_fs_context(fsc);
 	return mnt;
 }
@@ -335,13 +336,6 @@ const struct dentry_operations hffuse_dentry_operations = {
 	.d_release	= hffuse_dentry_release,
 #endif
 	.d_automount	= hffuse_dentry_automount,
-};
-
-const struct dentry_operations hffuse_root_dentry_operations = {
-#if BITS_PER_LONG < 64
-	.d_init		= hffuse_dentry_init,
-	.d_release	= hffuse_dentry_release,
-#endif
 };
 
 int hffuse_valid_type(int m)
@@ -366,12 +360,12 @@ int hffuse_lookup_name(struct super_block *sb, u64 nodeid, const struct qstr *na
 	struct hffuse_mount *fm = get_hffuse_mount_super(sb);
 	HFFUSE_ARGS(args);
 	struct hffuse_forget_link *forget;
-	u64 attr_version;
+	u64 attr_version, evict_ctr;
 	int err;
 
 	*inode = NULL;
 	err = -ENAMETOOLONG;
-	if (name->len > HFFUSE_NAME_MAX)
+	if (name->len > fm->fc->name_max)
 		goto out;
 
 
@@ -381,6 +375,7 @@ int hffuse_lookup_name(struct super_block *sb, u64 nodeid, const struct qstr *na
 		goto out;
 
 	attr_version = hffuse_get_attr_version(fm->fc);
+	evict_ctr = hffuse_get_evict_ctr(fm->fc);
 
 	hffuse_lookup_init(fm->fc, &args, nodeid, name, outarg);
 	err = hffuse_simple_request(fm, &args);
@@ -398,7 +393,7 @@ int hffuse_lookup_name(struct super_block *sb, u64 nodeid, const struct qstr *na
 
 	*inode = hffuse_iget(sb, outarg->nodeid, outarg->generation,
 			   &outarg->attr, ATTR_TIMEOUT(outarg),
-			   attr_version);
+			   attr_version, evict_ctr);
 	err = -ENOMEM;
 	if (!*inode) {
 		hffuse_queue_forget(fm->fc, forget, outarg->nodeid, 1);
@@ -415,15 +410,19 @@ int hffuse_lookup_name(struct super_block *sb, u64 nodeid, const struct qstr *na
 static struct dentry *hffuse_lookup(struct inode *dir, struct dentry *entry,
 				  unsigned int flags)
 {
-	int err;
 	struct hffuse_entry_out outarg;
+	struct hffuse_conn *fc;
 	struct inode *inode;
 	struct dentry *newent;
+	int err, epoch;
 	bool outarg_valid = true;
 	bool locked;
 
 	if (hffuse_is_bad(dir))
 		return ERR_PTR(-EIO);
+
+	fc = get_hffuse_conn_super(dir->i_sb);
+	epoch = atomic_read(&fc->epoch);
 
 	locked = hffuse_lock_inode(dir);
 	err = hffuse_lookup_name(dir->i_sb, get_node_id(dir), &entry->d_name,
@@ -446,6 +445,7 @@ static struct dentry *hffuse_lookup(struct inode *dir, struct dentry *entry,
 		goto out_err;
 
 	entry = newent ? newent : entry;
+	entry->d_time = epoch;
 	if (outarg_valid)
 		hffuse_change_entry_timeout(entry, &outarg);
 	else
@@ -466,7 +466,7 @@ static int get_security_context(struct dentry *entry, umode_t mode,
 {
 	struct hffuse_secctx *fctx;
 	struct hffuse_secctx_header *header;
-	struct lsmcontext lsmctx = { };
+	struct lsm_context lsmctx = { };
 	void *ptr;
 	u32 total_len = sizeof(*header);
 	int err, nr_ctx = 0;
@@ -546,17 +546,21 @@ static u32 hffuse_ext_size(size_t size)
 /*
  * This adds just a single supplementary group that matches the parent's group.
  */
-static int get_create_supp_group(struct inode *dir, struct hffuse_in_arg *ext)
+static int get_create_supp_group(struct mnt_idmap *idmap,
+				 struct inode *dir,
+				 struct hffuse_in_arg *ext)
 {
 	struct hffuse_conn *fc = get_hffuse_conn(dir);
 	struct hffuse_ext_header *xh;
 	struct hffuse_supp_groups *sg;
 	kgid_t kgid = dir->i_gid;
+	vfsgid_t vfsgid = make_vfsgid(idmap, fc->user_ns, kgid);
 	gid_t parent_gid = from_kgid(fc->user_ns, kgid);
+
 	u32 sg_len = hffuse_ext_size(sizeof(*sg) + sizeof(sg->groups[0]));
 
-	if (parent_gid == (gid_t) -1 || gid_eq(kgid, current_fsgid()) ||
-	    !in_group_p(kgid))
+	if (parent_gid == (gid_t) -1 || vfsgid_eq_kgid(vfsgid, current_fsgid()) ||
+	    !vfsgid_in_group_p(vfsgid))
 		return 0;
 
 	xh = extend_arg(ext, sg_len);
@@ -573,7 +577,8 @@ static int get_create_supp_group(struct inode *dir, struct hffuse_in_arg *ext)
 	return 0;
 }
 
-static int get_create_ext(struct hffuse_args *args,
+static int get_create_ext(struct mnt_idmap *idmap,
+			  struct hffuse_args *args,
 			  struct inode *dir, struct dentry *dentry,
 			  umode_t mode)
 {
@@ -584,7 +589,7 @@ static int get_create_ext(struct hffuse_args *args,
 	if (fc->init_security)
 		err = get_security_context(dentry, mode, &ext);
 	if (!err && fc->create_supp_group)
-		err = get_create_supp_group(dir, &ext);
+		err = get_create_supp_group(idmap, dir, &ext);
 
 	if (!err && ext.size) {
 		WARN_ON(args->in_numargs >= ARRAY_SIZE(args->in_args));
@@ -610,32 +615,33 @@ static void free_ext_value(struct hffuse_args *args)
  * If the filesystem doesn't support this, then fall back to separate
  * 'mknod' + 'open' requests.
  */
-static int hffuse_create_open(struct inode *dir, struct dentry *entry,
-			    struct file *file, unsigned int flags,
-			    umode_t mode, u32 opcode)
+static int hffuse_create_open(struct mnt_idmap *idmap, struct inode *dir,
+			    struct dentry *entry, struct file *file,
+			    unsigned int flags, umode_t mode, u32 opcode)
 {
-	int err;
 	struct inode *inode;
 	struct hffuse_mount *fm = get_hffuse_mount(dir);
 	HFFUSE_ARGS(args);
 	struct hffuse_forget_link *forget;
 	struct hffuse_create_in inarg;
-	struct hffuse_open_out outopen;
+	struct hffuse_open_out *outopenp;
 	struct hffuse_entry_out outentry;
 	struct hffuse_inode *fi;
 	struct hffuse_file *ff;
+	int epoch, err;
 	bool trunc = flags & O_TRUNC;
 
 	/* Userspace expects S_IFREG in create mode */
 	BUG_ON((mode & S_IFMT) != S_IFREG);
 
+	epoch = atomic_read(&fm->fc->epoch);
 	forget = hffuse_alloc_forget();
 	err = -ENOMEM;
 	if (!forget)
 		goto out_err;
 
 	err = -ENOMEM;
-	ff = hffuse_file_alloc(fm);
+	ff = hffuse_file_alloc(fm, true);
 	if (!ff)
 		goto out_put_forget_req;
 
@@ -664,14 +670,16 @@ static int hffuse_create_open(struct inode *dir, struct dentry *entry,
 	args.out_numargs = 2;
 	args.out_args[0].size = sizeof(outentry);
 	args.out_args[0].value = &outentry;
-	args.out_args[1].size = sizeof(outopen);
-	args.out_args[1].value = &outopen;
+	/* Store outarg for hffuse_finish_open() */
+	outopenp = &ff->args->open_outarg;
+	args.out_args[1].size = sizeof(*outopenp);
+	args.out_args[1].value = outopenp;
 
-	err = get_create_ext(&args, dir, entry, mode);
+	err = get_create_ext(idmap, &args, dir, entry, mode);
 	if (err)
 		goto out_free_ff;
 
-	err = hffuse_simple_request(fm, &args);
+	err = hffuse_simple_idmap_request(idmap, fm, &args);
 	free_ext_value(&args);
 	if (err)
 		goto out_free_ff;
@@ -681,11 +689,11 @@ static int hffuse_create_open(struct inode *dir, struct dentry *entry,
 	    hffuse_invalid_attr(&outentry.attr))
 		goto out_free_ff;
 
-	ff->fh = outopen.fh;
+	ff->fh = outopenp->fh;
 	ff->nodeid = outentry.nodeid;
-	ff->open_flags = outopen.open_flags;
+	ff->open_flags = outopenp->open_flags;
 	inode = hffuse_iget(dir->i_sb, outentry.nodeid, outentry.generation,
-			  &outentry.attr, ATTR_TIMEOUT(&outentry), 0);
+			  &outentry.attr, ATTR_TIMEOUT(&outentry), 0, 0);
 	if (!inode) {
 		flags &= ~(O_CREAT | O_EXCL | O_TRUNC);
 		hffuse_sync_release(NULL, ff, flags);
@@ -695,15 +703,18 @@ static int hffuse_create_open(struct inode *dir, struct dentry *entry,
 	}
 	kfree(forget);
 	d_instantiate(entry, inode);
+	entry->d_time = epoch;
 	hffuse_change_entry_timeout(entry, &outentry);
 	hffuse_dir_changed(dir);
-	err = finish_open(file, entry, generic_file_open);
+	err = generic_file_open(inode, file);
+	if (!err) {
+		file->private_data = ff;
+		err = finish_open(file, entry, hffuse_finish_open);
+	}
 	if (err) {
 		fi = get_hffuse_inode(inode);
 		hffuse_sync_release(fi, ff, flags);
 	} else {
-		file->private_data = ff;
-		hffuse_finish_open(inode, file);
 		if (fm->fc->atomic_o_trunc && trunc)
 			truncate_pagecache(inode, 0);
 		else if (!(ff->open_flags & FOPEN_KEEP_CACHE))
@@ -726,6 +737,7 @@ static int hffuse_atomic_open(struct inode *dir, struct dentry *entry,
 			    umode_t mode)
 {
 	int err;
+	struct mnt_idmap *idmap = file_mnt_idmap(file);
 	struct hffuse_conn *fc = get_hffuse_conn(dir);
 	struct dentry *res = NULL;
 
@@ -750,7 +762,7 @@ static int hffuse_atomic_open(struct inode *dir, struct dentry *entry,
 	if (fc->no_create)
 		goto mknod;
 
-	err = hffuse_create_open(dir, entry, file, flags, mode, HFFUSE_CREATE);
+	err = hffuse_create_open(idmap, dir, entry, file, flags, mode, HFFUSE_CREATE);
 	if (err == -ENOSYS) {
 		fc->no_create = 1;
 		goto mknod;
@@ -761,7 +773,7 @@ out_dput:
 	return err;
 
 mknod:
-	err = hffuse_mknod(&nop_mnt_idmap, dir, entry, mode, 0);
+	err = hffuse_mknod(idmap, dir, entry, mode, 0);
 	if (err)
 		goto out_dput;
 no_open:
@@ -771,22 +783,24 @@ no_open:
 /*
  * Code shared between mknod, mkdir, symlink and link
  */
-static int create_new_entry(struct hffuse_mount *fm, struct hffuse_args *args,
-			    struct inode *dir, struct dentry *entry,
-			    umode_t mode)
+static struct dentry *create_new_entry(struct mnt_idmap *idmap, struct hffuse_mount *fm,
+				       struct hffuse_args *args, struct inode *dir,
+				       struct dentry *entry, umode_t mode)
 {
 	struct hffuse_entry_out outarg;
 	struct inode *inode;
 	struct dentry *d;
-	int err;
 	struct hffuse_forget_link *forget;
+	int epoch, err;
 
 	if (hffuse_is_bad(dir))
-		return -EIO;
+		return ERR_PTR(-EIO);
+
+	epoch = atomic_read(&fm->fc->epoch);
 
 	forget = hffuse_alloc_forget();
 	if (!forget)
-		return -ENOMEM;
+		return ERR_PTR(-ENOMEM);
 
 	memset(&outarg, 0, sizeof(outarg));
 	args->nodeid = get_node_id(dir);
@@ -795,12 +809,12 @@ static int create_new_entry(struct hffuse_mount *fm, struct hffuse_args *args,
 	args->out_args[0].value = &outarg;
 
 	if (args->opcode != HFFUSE_LINK) {
-		err = get_create_ext(args, dir, entry, mode);
+		err = get_create_ext(idmap, args, dir, entry, mode);
 		if (err)
 			goto out_put_forget_req;
 	}
 
-	err = hffuse_simple_request(fm, args);
+	err = hffuse_simple_idmap_request(idmap, fm, args);
 	free_ext_value(args);
 	if (err)
 		goto out_put_forget_req;
@@ -813,32 +827,49 @@ static int create_new_entry(struct hffuse_mount *fm, struct hffuse_args *args,
 		goto out_put_forget_req;
 
 	inode = hffuse_iget(dir->i_sb, outarg.nodeid, outarg.generation,
-			  &outarg.attr, ATTR_TIMEOUT(&outarg), 0);
+			  &outarg.attr, ATTR_TIMEOUT(&outarg), 0, 0);
 	if (!inode) {
 		hffuse_queue_forget(fm->fc, forget, outarg.nodeid, 1);
-		return -ENOMEM;
+		return ERR_PTR(-ENOMEM);
 	}
 	kfree(forget);
 
 	d_drop(entry);
 	d = d_splice_alias(inode, entry);
 	if (IS_ERR(d))
-		return PTR_ERR(d);
+		return d;
 
 	if (d) {
+		d->d_time = epoch;
 		hffuse_change_entry_timeout(d, &outarg);
-		dput(d);
 	} else {
+		entry->d_time = epoch;
 		hffuse_change_entry_timeout(entry, &outarg);
 	}
 	hffuse_dir_changed(dir);
-	return 0;
+	return d;
 
  out_put_forget_req:
 	if (err == -EEXIST)
 		hffuse_invalidate_entry(entry);
 	kfree(forget);
-	return err;
+	return ERR_PTR(err);
+}
+
+static int create_new_nondir(struct mnt_idmap *idmap, struct hffuse_mount *fm,
+			     struct hffuse_args *args, struct inode *dir,
+			     struct dentry *entry, umode_t mode)
+{
+	/*
+	 * Note that when creating anything other than a directory we
+	 * can be sure create_new_entry() will NOT return an alternate
+	 * dentry as d_splice_alias() only returns an alternate dentry
+	 * for directories.  So we don't need to check for that case
+	 * when passing back the result.
+	 */
+	WARN_ON_ONCE(S_ISDIR(mode));
+
+	return PTR_ERR(create_new_entry(idmap, fm, args, dir, entry, mode));
 }
 
 static int hffuse_mknod(struct mnt_idmap *idmap, struct inode *dir,
@@ -861,13 +892,13 @@ static int hffuse_mknod(struct mnt_idmap *idmap, struct inode *dir,
 	args.in_args[0].value = &inarg;
 	args.in_args[1].size = entry->d_name.len + 1;
 	args.in_args[1].value = entry->d_name.name;
-	return create_new_entry(fm, &args, dir, entry, mode);
+	return create_new_nondir(idmap, fm, &args, dir, entry, mode);
 }
 
 static int hffuse_create(struct mnt_idmap *idmap, struct inode *dir,
 		       struct dentry *entry, umode_t mode, bool excl)
 {
-	return hffuse_mknod(&nop_mnt_idmap, dir, entry, mode, 0);
+	return hffuse_mknod(idmap, dir, entry, mode, 0);
 }
 
 static int hffuse_tmpfile(struct mnt_idmap *idmap, struct inode *dir,
@@ -879,7 +910,8 @@ static int hffuse_tmpfile(struct mnt_idmap *idmap, struct inode *dir,
 	if (fc->no_tmpfile)
 		return -EOPNOTSUPP;
 
-	err = hffuse_create_open(dir, file->f_path.dentry, file, file->f_flags, mode, HFFUSE_TMPFILE);
+	err = hffuse_create_open(idmap, dir, file->f_path.dentry, file,
+			       file->f_flags, mode, HFFUSE_TMPFILE);
 	if (err == -ENOSYS) {
 		fc->no_tmpfile = 1;
 		err = -EOPNOTSUPP;
@@ -887,8 +919,8 @@ static int hffuse_tmpfile(struct mnt_idmap *idmap, struct inode *dir,
 	return err;
 }
 
-static int hffuse_mkdir(struct mnt_idmap *idmap, struct inode *dir,
-		      struct dentry *entry, umode_t mode)
+static struct dentry *hffuse_mkdir(struct mnt_idmap *idmap, struct inode *dir,
+				 struct dentry *entry, umode_t mode)
 {
 	struct hffuse_mkdir_in inarg;
 	struct hffuse_mount *fm = get_hffuse_mount(dir);
@@ -906,7 +938,7 @@ static int hffuse_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	args.in_args[0].value = &inarg;
 	args.in_args[1].size = entry->d_name.len + 1;
 	args.in_args[1].value = entry->d_name.name;
-	return create_new_entry(fm, &args, dir, entry, S_IFDIR);
+	return create_new_entry(idmap, fm, &args, dir, entry, S_IFDIR);
 }
 
 static int hffuse_symlink(struct mnt_idmap *idmap, struct inode *dir,
@@ -917,12 +949,13 @@ static int hffuse_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	HFFUSE_ARGS(args);
 
 	args.opcode = HFFUSE_SYMLINK;
-	args.in_numargs = 2;
-	args.in_args[0].size = entry->d_name.len + 1;
-	args.in_args[0].value = entry->d_name.name;
-	args.in_args[1].size = len;
-	args.in_args[1].value = link;
-	return create_new_entry(fm, &args, dir, entry, S_IFLNK);
+	args.in_numargs = 3;
+	hffuse_set_zero_arg0(&args);
+	args.in_args[1].size = entry->d_name.len + 1;
+	args.in_args[1].value = entry->d_name.name;
+	args.in_args[2].size = len;
+	args.in_args[2].value = link;
+	return create_new_nondir(idmap, fm, &args, dir, entry, S_IFLNK);
 }
 
 void hffuse_flush_time_update(struct inode *inode)
@@ -981,9 +1014,10 @@ static int hffuse_unlink(struct inode *dir, struct dentry *entry)
 
 	args.opcode = HFFUSE_UNLINK;
 	args.nodeid = get_node_id(dir);
-	args.in_numargs = 1;
-	args.in_args[0].size = entry->d_name.len + 1;
-	args.in_args[0].value = entry->d_name.name;
+	args.in_numargs = 2;
+	hffuse_set_zero_arg0(&args);
+	args.in_args[1].size = entry->d_name.len + 1;
+	args.in_args[1].value = entry->d_name.name;
 	err = hffuse_simple_request(fm, &args);
 	if (!err) {
 		hffuse_dir_changed(dir);
@@ -1004,9 +1038,10 @@ static int hffuse_rmdir(struct inode *dir, struct dentry *entry)
 
 	args.opcode = HFFUSE_RMDIR;
 	args.nodeid = get_node_id(dir);
-	args.in_numargs = 1;
-	args.in_args[0].size = entry->d_name.len + 1;
-	args.in_args[0].value = entry->d_name.name;
+	args.in_numargs = 2;
+	hffuse_set_zero_arg0(&args);
+	args.in_args[1].size = entry->d_name.len + 1;
+	args.in_args[1].value = entry->d_name.name;
 	err = hffuse_simple_request(fm, &args);
 	if (!err) {
 		hffuse_dir_changed(dir);
@@ -1016,7 +1051,7 @@ static int hffuse_rmdir(struct inode *dir, struct dentry *entry)
 	return err;
 }
 
-static int hffuse_rename_common(struct inode *olddir, struct dentry *oldent,
+static int hffuse_rename_common(struct mnt_idmap *idmap, struct inode *olddir, struct dentry *oldent,
 			      struct inode *newdir, struct dentry *newent,
 			      unsigned int flags, int opcode, size_t argsize)
 {
@@ -1037,7 +1072,7 @@ static int hffuse_rename_common(struct inode *olddir, struct dentry *oldent,
 	args.in_args[1].value = oldent->d_name.name;
 	args.in_args[2].size = newent->d_name.len + 1;
 	args.in_args[2].value = newent->d_name.name;
-	err = hffuse_simple_request(fm, &args);
+	err = hffuse_simple_idmap_request(idmap, fm, &args);
 	if (!err) {
 		/* ctime changes */
 		hffuse_update_ctime(d_inode(oldent));
@@ -1083,7 +1118,8 @@ static int hffuse_rename2(struct mnt_idmap *idmap, struct inode *olddir,
 		if (fc->no_rename2 || fc->minor < 23)
 			return -EINVAL;
 
-		err = hffuse_rename_common(olddir, oldent, newdir, newent, flags,
+		err = hffuse_rename_common((flags & RENAME_WHITEOUT) ? idmap : &invalid_mnt_idmap,
+					 olddir, oldent, newdir, newent, flags,
 					 HFFUSE_RENAME2,
 					 sizeof(struct hffuse_rename2_in));
 		if (err == -ENOSYS) {
@@ -1091,7 +1127,7 @@ static int hffuse_rename2(struct mnt_idmap *idmap, struct inode *olddir,
 			err = -EINVAL;
 		}
 	} else {
-		err = hffuse_rename_common(olddir, oldent, newdir, newent, 0,
+		err = hffuse_rename_common(&invalid_mnt_idmap, olddir, oldent, newdir, newent, 0,
 					 HFFUSE_RENAME,
 					 sizeof(struct hffuse_rename_in));
 	}
@@ -1108,6 +1144,9 @@ static int hffuse_link(struct dentry *entry, struct inode *newdir,
 	struct hffuse_mount *fm = get_hffuse_mount(inode);
 	HFFUSE_ARGS(args);
 
+	if (fm->fc->no_link)
+		goto out;
+
 	memset(&inarg, 0, sizeof(inarg));
 	inarg.oldnodeid = get_node_id(inode);
 	args.opcode = HFFUSE_LINK;
@@ -1116,27 +1155,37 @@ static int hffuse_link(struct dentry *entry, struct inode *newdir,
 	args.in_args[0].value = &inarg;
 	args.in_args[1].size = newent->d_name.len + 1;
 	args.in_args[1].value = newent->d_name.name;
-	err = create_new_entry(fm, &args, newdir, newent, inode->i_mode);
+	err = create_new_nondir(&invalid_mnt_idmap, fm, &args, newdir, newent, inode->i_mode);
 	if (!err)
 		hffuse_update_ctime_in_cache(inode);
 	else if (err == -EINTR)
 		hffuse_invalidate_attr(inode);
 
+	if (err == -ENOSYS)
+		fm->fc->no_link = 1;
+out:
+	if (fm->fc->no_link)
+		return -EPERM;
+
 	return err;
 }
 
-static void hffuse_fillattr(struct inode *inode, struct hffuse_attr *attr,
-			  struct kstat *stat)
+static void hffuse_fillattr(struct mnt_idmap *idmap, struct inode *inode,
+			  struct hffuse_attr *attr, struct kstat *stat)
 {
 	unsigned int blkbits;
 	struct hffuse_conn *fc = get_hffuse_conn(inode);
+	vfsuid_t vfsuid = make_vfsuid(idmap, fc->user_ns,
+				      make_kuid(fc->user_ns, attr->uid));
+	vfsgid_t vfsgid = make_vfsgid(idmap, fc->user_ns,
+				      make_kgid(fc->user_ns, attr->gid));
 
 	stat->dev = inode->i_sb->s_dev;
 	stat->ino = attr->ino;
 	stat->mode = (inode->i_mode & S_IFMT) | (attr->mode & 07777);
 	stat->nlink = attr->nlink;
-	stat->uid = make_kuid(fc->user_ns, attr->uid);
-	stat->gid = make_kgid(fc->user_ns, attr->gid);
+	stat->uid = vfsuid_into_kuid(vfsuid);
+	stat->gid = vfsgid_into_kgid(vfsgid);
 	stat->rdev = inode->i_rdev;
 	stat->atime.tv_sec = attr->atime;
 	stat->atime.tv_nsec = attr->atimensec;
@@ -1150,7 +1199,7 @@ static void hffuse_fillattr(struct inode *inode, struct hffuse_attr *attr,
 	if (attr->blksize != 0)
 		blkbits = ilog2(attr->blksize);
 	else
-		blkbits = inode->i_sb->s_blocksize_bits;
+		blkbits = fc->blkbits;
 
 	stat->blksize = 1 << blkbits;
 }
@@ -1175,8 +1224,8 @@ static void hffuse_statx_to_attr(struct hffuse_statx *sx, struct hffuse_attr *at
 	attr->blksize = sx->blksize;
 }
 
-static int hffuse_do_statx(struct inode *inode, struct file *file,
-			 struct kstat *stat)
+static int hffuse_do_statx(struct mnt_idmap *idmap, struct inode *inode,
+			 struct file *file, struct kstat *stat)
 {
 	int err;
 	struct hffuse_attr attr;
@@ -1229,15 +1278,15 @@ static int hffuse_do_statx(struct inode *inode, struct file *file,
 		stat->result_mask = sx->mask & (STATX_BASIC_STATS | STATX_BTIME);
 		stat->btime.tv_sec = sx->btime.tv_sec;
 		stat->btime.tv_nsec = min_t(u32, sx->btime.tv_nsec, NSEC_PER_SEC - 1);
-		hffuse_fillattr(inode, &attr, stat);
+		hffuse_fillattr(idmap, inode, &attr, stat);
 		stat->result_mask |= STATX_TYPE;
 	}
 
 	return 0;
 }
 
-static int hffuse_do_getattr(struct inode *inode, struct kstat *stat,
-			   struct file *file)
+static int hffuse_do_getattr(struct mnt_idmap *idmap, struct inode *inode,
+			   struct kstat *stat, struct file *file)
 {
 	int err;
 	struct hffuse_getattr_in inarg;
@@ -1276,15 +1325,15 @@ static int hffuse_do_getattr(struct inode *inode, struct kstat *stat,
 					       ATTR_TIMEOUT(&outarg),
 					       attr_version);
 			if (stat)
-				hffuse_fillattr(inode, &outarg.attr, stat);
+				hffuse_fillattr(idmap, inode, &outarg.attr, stat);
 		}
 	}
 	return err;
 }
 
-static int hffuse_update_get_attr(struct inode *inode, struct file *file,
-				struct kstat *stat, u32 request_mask,
-				unsigned int flags)
+static int hffuse_update_get_attr(struct mnt_idmap *idmap, struct inode *inode,
+				struct file *file, struct kstat *stat,
+				u32 request_mask, unsigned int flags)
 {
 	struct hffuse_inode *fi = get_hffuse_inode(inode);
 	struct hffuse_conn *fc = get_hffuse_conn(inode);
@@ -1315,19 +1364,20 @@ retry:
 		forget_all_cached_acls(inode);
 		/* Try statx if BTIME is requested */
 		if (!fc->no_statx && (request_mask & ~STATX_BASIC_STATS)) {
-			err = hffuse_do_statx(inode, file, stat);
+			err = hffuse_do_statx(idmap, inode, file, stat);
 			if (err == -ENOSYS) {
 				fc->no_statx = 1;
 				err = 0;
 				goto retry;
 			}
 		} else {
-			err = hffuse_do_getattr(inode, stat, file);
+			err = hffuse_do_getattr(idmap, inode, stat, file);
 		}
 	} else if (stat) {
-		generic_fillattr(&nop_mnt_idmap, request_mask, inode, stat);
+		generic_fillattr(idmap, request_mask, inode, stat);
 		stat->mode = fi->orig_i_mode;
 		stat->ino = fi->orig_ino;
+		stat->blksize = 1 << fi->cached_i_blkbits;
 		if (test_bit(HFFUSE_I_BTIME, &fi->state)) {
 			stat->btime = fi->i_btime;
 			stat->result_mask |= STATX_BTIME;
@@ -1339,7 +1389,7 @@ retry:
 
 int hffuse_update_attributes(struct inode *inode, struct file *file, u32 mask)
 {
-	return hffuse_update_get_attr(inode, file, NULL, mask, 0);
+	return hffuse_update_get_attr(&nop_mnt_idmap, inode, file, NULL, mask, 0);
 }
 
 int hffuse_reverse_inval_entry(struct hffuse_conn *fc, u64 parent_nodeid,
@@ -1459,6 +1509,14 @@ static int hffuse_access(struct inode *inode, int mask)
 
 	BUG_ON(mask & MAY_NOT_BLOCK);
 
+	/*
+	 * We should not send HFFUSE_ACCESS to the userspace
+	 * when idmapped mounts are enabled as for this case
+	 * we have fc->default_permissions = 1 and access
+	 * permission checks are done on the kernel side.
+	 */
+	WARN_ON_ONCE(!(fm->sb->s_iflags & SB_I_NOIDMAP));
+
 	if (fm->fc->no_access)
 		return 0;
 
@@ -1483,7 +1541,7 @@ static int hffuse_perm_getattr(struct inode *inode, int mask)
 		return -ECHILD;
 
 	forget_all_cached_acls(inode);
-	return hffuse_do_getattr(inode, NULL, NULL);
+	return hffuse_do_getattr(&nop_mnt_idmap, inode, NULL, NULL);
 }
 
 /*
@@ -1491,7 +1549,7 @@ static int hffuse_perm_getattr(struct inode *inode, int mask)
  *
  * 1) Local access checking ('default_permissions' mount option) based
  * on file mode.  This is the plain old disk filesystem permission
- * modell.
+ * model.
  *
  * 2) "Remote" access checking, where server is responsible for
  * checking permission in each inode operation.  An exception to this
@@ -1531,7 +1589,7 @@ static int hffuse_permission(struct mnt_idmap *idmap,
 	}
 
 	if (fc->default_permissions) {
-		err = generic_permission(&nop_mnt_idmap, inode, mask);
+		err = generic_permission(idmap, inode, mask);
 
 		/* If permission is denied, try to refresh file
 		   attributes.  This is also needed, because the root
@@ -1539,7 +1597,7 @@ static int hffuse_permission(struct mnt_idmap *idmap,
 		if (err == -EACCES && !refreshed) {
 			err = hffuse_perm_getattr(inode, mask);
 			if (!err)
-				err = generic_permission(&nop_mnt_idmap,
+				err = generic_permission(idmap,
 							 inode, mask);
 		}
 
@@ -1562,13 +1620,13 @@ static int hffuse_permission(struct mnt_idmap *idmap,
 	return err;
 }
 
-static int hffuse_readlink_page(struct inode *inode, struct page *page)
+static int hffuse_readlink_folio(struct inode *inode, struct folio *folio)
 {
 	struct hffuse_mount *fm = get_hffuse_mount(inode);
-	struct hffuse_page_desc desc = { .length = PAGE_SIZE - 1 };
+	struct hffuse_folio_desc desc = { .length = folio_size(folio) - 1 };
 	struct hffuse_args_pages ap = {
-		.num_pages = 1,
-		.pages = &page,
+		.num_folios = 1,
+		.folios = &folio,
 		.descs = &desc,
 	};
 	char *link;
@@ -1591,7 +1649,7 @@ static int hffuse_readlink_page(struct inode *inode, struct page *page)
 	if (WARN_ON(res >= PAGE_SIZE))
 		return -EIO;
 
-	link = page_address(page);
+	link = folio_address(folio);
 	link[res] = '\0';
 
 	return 0;
@@ -1601,7 +1659,7 @@ static const char *hffuse_get_link(struct dentry *dentry, struct inode *inode,
 				 struct delayed_call *callback)
 {
 	struct hffuse_conn *fc = get_hffuse_conn(inode);
-	struct page *page;
+	struct folio *folio;
 	int err;
 
 	err = -EIO;
@@ -1609,26 +1667,26 @@ static const char *hffuse_get_link(struct dentry *dentry, struct inode *inode,
 		goto out_err;
 
 	if (fc->cache_symlinks)
-		return page_get_link(dentry, inode, callback);
+		return page_get_link_raw(dentry, inode, callback);
 
 	err = -ECHILD;
 	if (!dentry)
 		goto out_err;
 
-	page = alloc_page(GFP_KERNEL);
+	folio = folio_alloc(GFP_KERNEL, 0);
 	err = -ENOMEM;
-	if (!page)
+	if (!folio)
 		goto out_err;
 
-	err = hffuse_readlink_page(inode, page);
+	err = hffuse_readlink_folio(inode, folio);
 	if (err) {
-		__free_page(page);
+		folio_put(folio);
 		goto out_err;
 	}
 
-	set_delayed_call(callback, page_put_link, page);
+	set_delayed_call(callback, page_put_link, folio);
 
-	return page_address(page);
+	return folio_address(folio);
 
 out_err:
 	return ERR_PTR(err);
@@ -1636,7 +1694,32 @@ out_err:
 
 static int hffuse_dir_open(struct inode *inode, struct file *file)
 {
-	return hffuse_open_common(inode, file, true);
+	struct hffuse_mount *fm = get_hffuse_mount(inode);
+	int err;
+
+	if (hffuse_is_bad(inode))
+		return -EIO;
+
+	err = generic_file_open(inode, file);
+	if (err)
+		return err;
+
+	err = hffuse_do_open(fm, get_node_id(inode), file, true);
+	if (!err) {
+		struct hffuse_file *ff = file->private_data;
+
+		/*
+		 * Keep handling FOPEN_STREAM and FOPEN_NONSEEKABLE for
+		 * directories for backward compatibility, though it's unlikely
+		 * to be useful.
+		 */
+		if (ff->open_flags & (FOPEN_STREAM | FOPEN_NONSEEKABLE))
+			nonseekable_open(inode, file);
+		if (!(ff->open_flags & FOPEN_KEEP_CACHE))
+			invalidate_inode_pages2(inode->i_mapping);
+	}
+
+	return err;
 }
 
 static int hffuse_dir_release(struct inode *inode, struct file *file)
@@ -1712,17 +1795,29 @@ static bool update_mtime(unsigned ivalid, bool trust_local_mtime)
 	return true;
 }
 
-static void iattr_to_fattr(struct hffuse_conn *fc, struct iattr *iattr,
-			   struct hffuse_setattr_in *arg, bool trust_local_cmtime)
+static void iattr_to_fattr(struct mnt_idmap *idmap, struct hffuse_conn *fc,
+			   struct iattr *iattr, struct hffuse_setattr_in *arg,
+			   bool trust_local_cmtime)
 {
 	unsigned ivalid = iattr->ia_valid;
 
 	if (ivalid & ATTR_MODE)
 		arg->valid |= FATTR_MODE,   arg->mode = iattr->ia_mode;
-	if (ivalid & ATTR_UID)
-		arg->valid |= FATTR_UID,    arg->uid = from_kuid(fc->user_ns, iattr->ia_uid);
-	if (ivalid & ATTR_GID)
-		arg->valid |= FATTR_GID,    arg->gid = from_kgid(fc->user_ns, iattr->ia_gid);
+
+	if (ivalid & ATTR_UID) {
+		kuid_t fsuid = from_vfsuid(idmap, fc->user_ns, iattr->ia_vfsuid);
+
+		arg->valid |= FATTR_UID;
+		arg->uid = from_kuid(fc->user_ns, fsuid);
+	}
+
+	if (ivalid & ATTR_GID) {
+		kgid_t fsgid = from_vfsgid(idmap, fc->user_ns, iattr->ia_vfsgid);
+
+		arg->valid |= FATTR_GID;
+		arg->gid = from_kgid(fc->user_ns, fsgid);
+	}
+
 	if (ivalid & ATTR_SIZE)
 		arg->valid |= FATTR_SIZE,   arg->size = iattr->ia_size;
 	if (ivalid & ATTR_ATIME) {
@@ -1842,8 +1937,8 @@ int hffuse_flush_times(struct inode *inode, struct hffuse_file *ff)
  * vmtruncate() doesn't allow for this case, so do the rlimit checking
  * and the actual truncation by hand.
  */
-int hffuse_do_setattr(struct dentry *dentry, struct iattr *attr,
-		    struct file *file)
+int hffuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+		    struct iattr *attr, struct file *file)
 {
 	struct inode *inode = d_inode(dentry);
 	struct hffuse_mount *fm = get_hffuse_mount(inode);
@@ -1859,11 +1954,12 @@ int hffuse_do_setattr(struct dentry *dentry, struct iattr *attr,
 	int err;
 	bool trust_local_cmtime = is_wb;
 	bool fault_blocked = false;
+	u64 attr_version;
 
 	if (!fc->default_permissions)
 		attr->ia_valid |= ATTR_FORCE;
 
-	err = setattr_prepare(&nop_mnt_idmap, dentry, attr);
+	err = setattr_prepare(idmap, dentry, attr);
 	if (err)
 		return err;
 
@@ -1876,7 +1972,7 @@ int hffuse_do_setattr(struct dentry *dentry, struct iattr *attr,
 	if (HFFUSE_IS_DAX(inode) && is_truncate) {
 		filemap_invalidate_lock(mapping);
 		fault_blocked = true;
-		err = hffuse_dax_break_layouts(inode, 0, 0);
+		err = hffuse_dax_break_layouts(inode, 0, -1);
 		if (err) {
 			filemap_invalidate_unlock(mapping);
 			return err;
@@ -1922,7 +2018,7 @@ int hffuse_do_setattr(struct dentry *dentry, struct iattr *attr,
 
 	memset(&inarg, 0, sizeof(inarg));
 	memset(&outarg, 0, sizeof(outarg));
-	iattr_to_fattr(fc, attr, &inarg, trust_local_cmtime);
+	iattr_to_fattr(idmap, fc, attr, &inarg, trust_local_cmtime);
 	if (file) {
 		struct hffuse_file *ff = file->private_data;
 		inarg.valid |= FATTR_FH;
@@ -1943,6 +2039,8 @@ int hffuse_do_setattr(struct dentry *dentry, struct iattr *attr,
 		if (fc->handle_killpriv_v2 && !capable(CAP_FSETID))
 			inarg.valid |= FATTR_KILL_SUIDGID;
 	}
+
+	attr_version = hffuse_get_attr_version(fm->fc);
 	hffuse_setattr_fill(fc, &args, inode, &inarg, &outarg);
 	err = hffuse_simple_request(fm, &args);
 	if (err) {
@@ -1968,9 +2066,17 @@ int hffuse_do_setattr(struct dentry *dentry, struct iattr *attr,
 		/* FIXME: clear I_DIRTY_SYNC? */
 	}
 
+	if (fi->attr_version > attr_version) {
+		/*
+		 * Apply attributes, for example for fsnotify_change(), but set
+		 * attribute timeout to zero.
+		 */
+		outarg.attr_valid = outarg.attr_valid_nsec = 0;
+	}
+
 	hffuse_change_attributes_common(inode, &outarg.attr, NULL,
 				      ATTR_TIMEOUT(&outarg),
-				      hffuse_get_cache_mask(inode));
+				      hffuse_get_cache_mask(inode), 0);
 	oldsize = inode->i_size;
 	/* see the comment in hffuse_change_attributes() */
 	if (!is_wb || is_truncate)
@@ -2039,7 +2145,7 @@ static int hffuse_setattr(struct mnt_idmap *idmap, struct dentry *entry,
 			 * ia_mode calculation may have used stale i_mode.
 			 * Refresh and recalculate.
 			 */
-			ret = hffuse_do_getattr(inode, NULL, file);
+			ret = hffuse_do_getattr(idmap, inode, NULL, file);
 			if (ret)
 				return ret;
 
@@ -2057,7 +2163,7 @@ static int hffuse_setattr(struct mnt_idmap *idmap, struct dentry *entry,
 	if (!attr->ia_valid)
 		return 0;
 
-	ret = hffuse_do_setattr(entry, attr, file);
+	ret = hffuse_do_setattr(idmap, entry, attr, file);
 	if (!ret) {
 		/*
 		 * If filesystem supports acls it may have updated acl xattrs in
@@ -2096,7 +2202,7 @@ static int hffuse_getattr(struct mnt_idmap *idmap,
 		return -EACCES;
 	}
 
-	return hffuse_update_get_attr(inode, NULL, stat, request_mask, flags);
+	return hffuse_update_get_attr(idmap, inode, NULL, stat, request_mask, flags);
 }
 
 static const struct inode_operations hffuse_dir_inode_operations = {
@@ -2173,7 +2279,7 @@ void hffuse_init_dir(struct inode *inode)
 
 static int hffuse_symlink_read_folio(struct file *null, struct folio *folio)
 {
-	int err = hffuse_readlink_page(folio->mapping->host, &folio->page);
+	int err = hffuse_readlink_folio(folio->mapping->host, folio);
 
 	if (!err)
 		folio_mark_uptodate(folio);
