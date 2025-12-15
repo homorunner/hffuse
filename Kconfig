@@ -2,6 +2,7 @@
 config HFFUSE_FS
 	tristate "HFFUSE (Filesystem in Userspace) support"
 	select FS_POSIX_ACL
+	select FS_IOMAP
 	help
 	  With HFFUSE it is possible to implement a fully functional filesystem
 	  in a userspace program.
@@ -52,3 +53,26 @@ config HFFUSE_DAX
 
 	  If you want to allow mounting a Virtio Filesystem with the "dax"
 	  option, answer Y.
+
+config HFFUSE_PASSTHROUGH
+	bool "HFFUSE passthrough operations support"
+	default y
+	depends on HFFUSE_FS
+	select FS_STACK
+	help
+	  This allows bypassing HFFUSE server by mapping specific HFFUSE operations
+	  to be performed directly on a backing file.
+
+	  If you want to allow passthrough operations, answer Y.
+
+config HFFUSE_IO_URING
+	bool "HFFUSE communication over io-uring"
+	default y
+	depends on HFFUSE_FS
+	depends on IO_URING
+	help
+	  This allows sending HFFUSE requests over the io-uring interface and
+          also adds request core affinity.
+
+	  If you want to allow hffuse server/client communication through io-uring,
+	  answer Y

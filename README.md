@@ -1,4 +1,4 @@
-Example code for fuse patch for 3fs based on 6.8 kernel.
+Example code for hffuse patch for 3fs based on 6.8 kernel.
 
 Q: Why `make[1]: *** /lib/modules/6.8.0-.../build: No such file or directory.  Stop.` ?
 

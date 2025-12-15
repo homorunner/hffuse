@@ -211,6 +211,30 @@
  *  7.39
  *  - add HFFUSE_DIRECT_IO_ALLOW_MMAP
  *  - add HFFUSE_STATX and related structures
+ *
+ *  7.40
+ *  - add max_stack_depth to hffuse_init_out, add HFFUSE_PASSTHROUGH init flag
+ *  - add backing_id to hffuse_open_out, add FOPEN_PASSTHROUGH open flag
+ *  - add HFFUSE_NO_EXPORT_SUPPORT init flag
+ *  - add HFFUSE_NOTIFY_RESEND, add HFFUSE_HAS_RESEND init flag
+ *
+ *  7.41
+ *  - add HFFUSE_ALLOW_IDMAP
+ *  7.42
+ *  - Add HFFUSE_OVER_IO_URING and all other io-uring related flags and data
+ *    structures:
+ *    - struct hffuse_uring_ent_in_out
+ *    - struct hffuse_uring_req_header
+ *    - struct hffuse_uring_cmd_req
+ *    - HFFUSE_URING_IN_OUT_HEADER_SZ
+ *    - HFFUSE_URING_OP_IN_OUT_SZ
+ *    - enum hffuse_uring_cmd
+ *
+ *  7.43
+ *  - add HFFUSE_REQUEST_TIMEOUT
+ *
+ *  7.44
+ *  - add HFFUSE_NOTIFY_INC_EPOCH
  */
 
 #ifndef _LINUX_HFFUSE_H
@@ -246,7 +270,7 @@
 #define HFFUSE_KERNEL_VERSION 7
 
 /** Minor version number of this interface */
-#define HFFUSE_KERNEL_MINOR_VERSION 39
+#define HFFUSE_KERNEL_MINOR_VERSION 44
 
 /** The node ID of the root inode */
 #define HFFUSE_ROOT_ID 1
@@ -353,6 +377,7 @@ struct hffuse_file_lock {
  * FOPEN_STREAM: the file is stream-like (no file position at all)
  * FOPEN_NOFLUSH: don't flush data cache on close (unless HFFUSE_WRITEBACK_CACHE)
  * FOPEN_PARALLEL_DIRECT_WRITES: Allow concurrent direct writes on the same inode
+ * FOPEN_PASSTHROUGH: passthrough read/write io for this open file
  */
 #define FOPEN_DIRECT_IO		(1 << 0)
 #define FOPEN_KEEP_CACHE	(1 << 1)
@@ -361,6 +386,7 @@ struct hffuse_file_lock {
 #define FOPEN_STREAM		(1 << 4)
 #define FOPEN_NOFLUSH		(1 << 5)
 #define FOPEN_PARALLEL_DIRECT_WRITES	(1 << 6)
+#define FOPEN_PASSTHROUGH	(1 << 7)
 
 /**
  * INIT request/reply flags
@@ -410,6 +436,13 @@ struct hffuse_file_lock {
  *			symlink and mknod (single group that matches parent)
  * HFFUSE_HAS_EXPIRE_ONLY: kernel supports expiry-only entry invalidation
  * HFFUSE_DIRECT_IO_ALLOW_MMAP: allow shared mmap in FOPEN_DIRECT_IO mode.
+ * HFFUSE_NO_EXPORT_SUPPORT: explicitly disable export support
+ * HFFUSE_HAS_RESEND: kernel supports resending pending requests, and the high bit
+ *		    of the request ID indicates resend requests
+ * HFFUSE_ALLOW_IDMAP: allow creation of idmapped mounts
+ * HFFUSE_OVER_IO_URING: Indicate that client supports io-uring
+ * HFFUSE_REQUEST_TIMEOUT: kernel supports timing out requests.
+ *			 init_out.request_timeout contains the timeout (in secs)
  */
 #define HFFUSE_ASYNC_READ		(1 << 0)
 #define HFFUSE_POSIX_LOCKS	(1 << 1)
@@ -449,9 +482,14 @@ struct hffuse_file_lock {
 #define HFFUSE_CREATE_SUPP_GROUP	(1ULL << 34)
 #define HFFUSE_HAS_EXPIRE_ONLY	(1ULL << 35)
 #define HFFUSE_DIRECT_IO_ALLOW_MMAP (1ULL << 36)
-
+#define HFFUSE_PASSTHROUGH	(1ULL << 37)
+#define HFFUSE_NO_EXPORT_SUPPORT	(1ULL << 38)
+#define HFFUSE_HAS_RESEND		(1ULL << 39)
 /* Obsolete alias for HFFUSE_DIRECT_IO_ALLOW_MMAP */
 #define HFFUSE_DIRECT_IO_RELAX	HFFUSE_DIRECT_IO_ALLOW_MMAP
+#define HFFUSE_ALLOW_IDMAP	(1ULL << 40)
+#define HFFUSE_OVER_IO_URING	(1ULL << 41)
+#define HFFUSE_REQUEST_TIMEOUT	(1ULL << 42)
 
 /**
  * CUSE INIT request/reply flags
@@ -635,6 +673,8 @@ enum hffuse_notify_code {
 	HFFUSE_NOTIFY_STORE = 4,
 	HFFUSE_NOTIFY_RETRIEVE = 5,
 	HFFUSE_NOTIFY_DELETE = 6,
+	HFFUSE_NOTIFY_RESEND = 7,
+	HFFUSE_NOTIFY_INC_EPOCH = 8,
 	HFFUSE_NOTIFY_CODE_MAX,
 };
 
@@ -761,7 +801,7 @@ struct hffuse_create_in {
 struct hffuse_open_out {
 	uint64_t	fh;
 	uint32_t	open_flags;
-	uint32_t	padding;
+	int32_t		backing_id;
 };
 
 struct hffuse_release_in {
@@ -877,7 +917,9 @@ struct hffuse_init_out {
 	uint16_t	max_pages;
 	uint16_t	map_alignment;
 	uint32_t	flags2;
-	uint32_t	unused[7];
+	uint32_t	max_stack_depth;
+	uint16_t	request_timeout;
+	uint16_t	unused[11];
 };
 
 #define CUSE_INIT_INFO_MAX 4096
@@ -959,6 +1001,29 @@ struct hffuse_fallocate_in {
 	uint32_t	mode;
 	uint32_t	padding;
 };
+
+/**
+ * HFFUSE request unique ID flag
+ *
+ * Indicates whether this is a resend request. The receiver should handle this
+ * request accordingly.
+ */
+#define HFFUSE_UNIQUE_RESEND (1ULL << 63)
+
+/**
+ * This value will be set by the kernel to
+ * (struct hffuse_in_header).{uid,gid} fields in
+ * case when:
+ * - hffuse daemon enabled HFFUSE_ALLOW_IDMAP
+ * - idmapping information is not available and uid/gid
+ *   can not be mapped in accordance with an idmapping.
+ *
+ * Note: an idmapping information always available
+ * for inode creation operations like:
+ * HFFUSE_MKNOD, HFFUSE_SYMLINK, HFFUSE_MKDIR, HFFUSE_TMPFILE,
+ * HFFUSE_CREATE and HFFUSE_RENAME2 (with RENAME_WHITEOUT).
+ */
+#define HFFUSE_INVALID_UIDGID ((uint32_t)(-1))
 
 struct hffuse_in_header {
 	uint32_t	len;
@@ -1049,9 +1114,18 @@ struct hffuse_notify_retrieve_in {
 	uint64_t	dummy4;
 };
 
+struct hffuse_backing_map {
+	int32_t		fd;
+	uint32_t	flags;
+	uint64_t	padding;
+};
+
 /* Device ioctls: */
 #define HFFUSE_DEV_IOC_MAGIC		229
 #define HFFUSE_DEV_IOC_CLONE		_IOR(HFFUSE_DEV_IOC_MAGIC, 0, uint32_t)
+#define HFFUSE_DEV_IOC_BACKING_OPEN	_IOW(HFFUSE_DEV_IOC_MAGIC, 1, \
+					     struct hffuse_backing_map)
+#define HFFUSE_DEV_IOC_BACKING_CLOSE	_IOW(HFFUSE_DEV_IOC_MAGIC, 2, uint32_t)
 
 struct hffuse_lseek_in {
 	uint64_t	fh;
@@ -1153,6 +1227,69 @@ struct hffuse_supp_groups {
 	uint32_t	groups[];
 };
 
-#define HFFUSE_MINOR 251
+/**
+ * Size of the ring buffer header
+ */
+#define HFFUSE_URING_IN_OUT_HEADER_SZ 128
+#define HFFUSE_URING_OP_IN_OUT_SZ 128
+
+/* Used as part of the hffuse_uring_req_header */
+struct hffuse_uring_ent_in_out {
+	uint64_t flags;
+
+	/*
+	 * commit ID to be used in a reply to a ring request (see also
+	 * struct hffuse_uring_cmd_req)
+	 */
+	uint64_t commit_id;
+
+	/* size of user payload buffer */
+	uint32_t payload_sz;
+	uint32_t padding;
+
+	uint64_t reserved;
+};
+
+/**
+ * Header for all hffuse-io-uring requests
+ */
+struct hffuse_uring_req_header {
+	/* struct hffuse_in_header / struct hffuse_out_header */
+	char in_out[HFFUSE_URING_IN_OUT_HEADER_SZ];
+
+	/* per op code header */
+	char op_in[HFFUSE_URING_OP_IN_OUT_SZ];
+
+	struct hffuse_uring_ent_in_out ring_ent_in_out;
+};
+
+/**
+ * sqe commands to the kernel
+ */
+enum hffuse_uring_cmd {
+	HFFUSE_IO_URING_CMD_INVALID = 0,
+
+	/* register the request buffer and fetch a hffuse request */
+	HFFUSE_IO_URING_CMD_REGISTER = 1,
+
+	/* commit hffuse request result and fetch next request */
+	HFFUSE_IO_URING_CMD_COMMIT_AND_FETCH = 2,
+};
+
+/**
+ * In the 80B command area of the SQE.
+ */
+struct hffuse_uring_cmd_req {
+	uint64_t flags;
+
+	/* entry identifier for commits */
+	uint64_t commit_id;
+
+	/* queue the command is for (queue index) */
+	uint16_t qid;
+	uint8_t padding[6];
+};
+
+#define HFFUSE_MINOR 229
 
 #endif /* _LINUX_HFFUSE_H */

@@ -33,19 +33,39 @@
 #include <linux/user_namespace.h>
 
 /** Default max number of pages that can be used in a single read request */
-#define HFFUSE_DEFAULT_MAX_PAGES_PER_REQ 4096
-
-/** Maximum of max_pages received in init_out */
-#define HFFUSE_MAX_MAX_PAGES 4096
+#define HFFUSE_DEFAULT_MAX_PAGES_PER_REQ 32
 
 /** Bias for fi->writectr, meaning new writepages must not be sent */
 #define HFFUSE_NOWRITE INT_MIN
 
-/** It could be as large as PATH_MAX, but would that have any uses? */
-#define HFFUSE_NAME_MAX 1024
+/** Maximum length of a filename, not including terminating null */
+
+/* maximum, small enough for HFFUSE_MIN_READ_BUFFER*/
+#define HFFUSE_NAME_LOW_MAX 1024
+/* maximum, but needs a request buffer > HFFUSE_MIN_READ_BUFFER */
+#define HFFUSE_NAME_MAX (PATH_MAX - 1)
 
 /** Number of dentries for each connection in the control filesystem */
 #define HFFUSE_CTL_NUM_DENTRIES 5
+
+/* Frequency (in seconds) of request timeout checks, if opted into */
+#define HFFUSE_TIMEOUT_TIMER_FREQ 15
+
+/** Frequency (in jiffies) of request timeout checks, if opted into */
+extern const unsigned long hffuse_timeout_timer_freq;
+
+/** Maximum of max_pages received in init_out */
+extern unsigned int hffuse_max_pages_limit;
+/*
+ * Default timeout (in seconds) for the server to reply to a request
+ * before the connection is aborted, if no timeout was specified on mount.
+ */
+extern unsigned int hffuse_default_req_timeout;
+/*
+ * Max timeout (in seconds) for the server to reply to a request before
+ * the connection is aborted.
+ */
+extern unsigned int hffuse_max_req_timeout;
 
 /** List of active connections */
 extern struct list_head hffuse_conn_list;
@@ -54,8 +74,8 @@ extern struct list_head hffuse_conn_list;
 extern struct mutex hffuse_mutex;
 
 /** Module parameters */
-extern unsigned max_user_bgreq;
-extern unsigned max_user_congthresh;
+extern unsigned int max_user_bgreq;
+extern unsigned int max_user_congthresh;
 
 /* One forget request */
 struct hffuse_forget_link {
@@ -74,6 +94,16 @@ struct hffuse_submount_lookup {
 
 	/** The request used for sending the FORGET message */
 	struct hffuse_forget_link *forget;
+};
+
+/** Container for data related to mapping to backing file */
+struct hffuse_backing {
+	struct file *file;
+	struct cred *cred;
+
+	/** refcount */
+	refcount_t count;
+	struct rcu_head rcu;
 };
 
 /** HFFUSE inode */
@@ -111,7 +141,7 @@ struct hffuse_inode {
 	u64 attr_version;
 
 	union {
-		/* Write related fields (regular file only) */
+		/* read/write io cache (regular file only) */
 		struct {
 			/* Files usable in writepage.  Protected by fi->lock */
 			struct list_head write_files;
@@ -123,11 +153,14 @@ struct hffuse_inode {
 			 * (HFFUSE_NOWRITE) means more writes are blocked */
 			int writectr;
 
+			/** Number of files/maps using page cache */
+			int iocachectr;
+
 			/* Waitq for writepage completion */
 			wait_queue_head_t page_waitq;
 
-			/* List of writepage requestst (pending or sent) */
-			struct rb_root writepages;
+			/* waitq for direct-io completion */
+			wait_queue_head_t direct_io_waitq;
 		};
 
 		/* readdir cache (directory only) */
@@ -173,6 +206,16 @@ struct hffuse_inode {
 #endif
 	/** Submount specific lookup tracking */
 	struct hffuse_submount_lookup *submount_lookup;
+#ifdef CONFIG_HFFUSE_PASSTHROUGH
+	/** Reference to backing file in passthrough mode */
+	struct hffuse_backing *fb;
+#endif
+
+	/*
+	 * The underlying inode->i_blkbits value will not be modified,
+	 * so preserve the blocksize specified by the server.
+	 */
+	u8 cached_i_blkbits;
 };
 
 /** HFFUSE inode state bits */
@@ -187,19 +230,21 @@ enum {
 	HFFUSE_I_BAD,
 	/* Has btime */
 	HFFUSE_I_BTIME,
+	/* Wants or already has page cache IO */
+	HFFUSE_I_CACHE_IO_MODE,
 };
 
 struct hffuse_conn;
 struct hffuse_mount;
-struct hffuse_release_args;
+union hffuse_file_args;
 
 /** HFFUSE specific file data */
 struct hffuse_file {
 	/** Fuse connection for this file */
 	struct hffuse_mount *fm;
 
-	/* Argument space reserved for release */
-	struct hffuse_release_args *release_args;
+	/* Argument space reserved for open/release */
+	union hffuse_file_args *args;
 
 	/** Kernel file handle guaranteed to be unique */
 	u64 kh;
@@ -221,12 +266,6 @@ struct hffuse_file {
 
 	/* Readdir related */
 	struct {
-		/*
-		 * Protects below fields against (crazy) parallel readdir on
-		 * same open file.  Uncontended in the normal case.
-		 */
-		struct mutex lock;
-
 		/* Dir stream position */
 		loff_t pos;
 
@@ -244,6 +283,15 @@ struct hffuse_file {
 	/** Wait queue head for poll */
 	wait_queue_head_t poll_wait;
 
+	/** Does file hold a fi->iocachectr refcount? */
+	enum { IOM_NONE, IOM_CACHED, IOM_UNCACHED } iomode;
+
+#ifdef CONFIG_HFFUSE_PASSTHROUGH
+	/** Reference to backing file in passthrough mode */
+	struct file *passthrough;
+	const struct cred *cred;
+#endif
+
 	/** Has flock been performed on this file? */
 	bool flock:1;
 };
@@ -260,8 +308,8 @@ struct hffuse_arg {
 	void *value;
 };
 
-/** HFFUSE page descriptor */
-struct hffuse_page_desc {
+/** HFFUSE folio descriptor */
+struct hffuse_folio_desc {
 	unsigned int length;
 	unsigned int offset;
 };
@@ -283,8 +331,9 @@ struct hffuse_args {
 	bool page_replace:1;
 	bool may_block:1;
 	bool is_ext:1;
+	bool is_pinned:1;
 	bool invalidate_vmap:1;
-	struct hffuse_in_arg in_args[3];
+	struct hffuse_in_arg in_args[4];
 	struct hffuse_arg out_args[2];
 	void (*end)(struct hffuse_mount *fm, struct hffuse_args *args, int error);
 	/* Used for kvec iter backed by vmalloc address */
@@ -293,9 +342,22 @@ struct hffuse_args {
 
 struct hffuse_args_pages {
 	struct hffuse_args args;
-	struct page **pages;
-	struct hffuse_page_desc *descs;
-	unsigned int num_pages;
+	struct folio **folios;
+	struct hffuse_folio_desc *descs;
+	unsigned int num_folios;
+};
+
+struct hffuse_release_args {
+	struct hffuse_args args;
+	struct hffuse_release_in inarg;
+	struct inode *inode;
+};
+
+union hffuse_file_args {
+	/* Used during open() */
+	struct hffuse_open_out open_outarg;
+	/* Used during release() */
+	struct hffuse_release_args release_args;
 };
 
 #define HFFUSE_ARGS(args) struct hffuse_args args = {}
@@ -339,6 +401,7 @@ struct hffuse_io_priv {
  * FR_FINISHED:		request is finished
  * FR_PRIVATE:		request is on private list
  * FR_ASYNC:		request is asynchronous
+ * FR_URING:		request is handled through hffuse-io-uring
  */
 enum hffuse_req_flag {
 	FR_ISREPLY,
@@ -353,6 +416,7 @@ enum hffuse_req_flag {
 	FR_FINISHED,
 	FR_PRIVATE,
 	FR_ASYNC,
+	FR_URING,
 };
 
 /**
@@ -399,6 +463,13 @@ struct hffuse_req {
 
 	/** hffuse_mount this request belongs to */
 	struct hffuse_mount *fm;
+
+#ifdef CONFIG_HFFUSE_IO_URING
+	void *ring_entry;
+	void *ring_queue;
+#endif
+	/** When (in jiffies) the request was created */
+	unsigned long create_time;
 };
 
 struct hffuse_iqueue;
@@ -413,22 +484,19 @@ struct hffuse_iqueue;
  */
 struct hffuse_iqueue_ops {
 	/**
-	 * Signal that a forget has been queued
+	 * Send one forget
 	 */
-	void (*wake_forget_and_unlock)(struct hffuse_iqueue *fiq)
-		__releases(fiq->lock);
+	void (*send_forget)(struct hffuse_iqueue *fiq, struct hffuse_forget_link *link);
 
 	/**
-	 * Signal that an INTERRUPT request has been queued
+	 * Send interrupt for request
 	 */
-	void (*wake_interrupt_and_unlock)(struct hffuse_iqueue *fiq)
-		__releases(fiq->lock);
+	void (*send_interrupt)(struct hffuse_iqueue *fiq, struct hffuse_req *req);
 
 	/**
-	 * Signal that a request has been queued
+	 * Send one request
 	 */
-	void (*wake_pending_and_unlock)(struct hffuse_iqueue *fiq)
-		__releases(fiq->lock);
+	void (*send_req)(struct hffuse_iqueue *fiq, struct hffuse_req *req);
 
 	/**
 	 * Clean up when hffuse_iqueue is destroyed
@@ -570,6 +638,9 @@ struct hffuse_conn {
 
 	/** Number of hffuse_dev's */
 	atomic_t dev_count;
+
+	/** Current epoch for up-to-date dentries */
+	atomic_t epoch;
 
 	struct rcu_head rcu;
 
@@ -821,8 +892,20 @@ struct hffuse_conn {
 	/* Is statx not implemented by fs? */
 	unsigned int no_statx:1;
 
+	/** Passthrough support for read/write IO */
+	unsigned int passthrough:1;
+
 	/* Use pages instead of pointer for kernel I/O */
 	unsigned int use_pages_for_kvec_io:1;
+
+	/* Is link not implemented by fs? */
+	unsigned int no_link:1;
+
+	/* Use io_uring for communication */
+	unsigned int io_uring;
+
+	/** Maximum stack depth for passthrough backing files */
+	int max_stack_depth;
 
 	/** The number of requests waiting for completion */
 	atomic_t num_waiting;
@@ -830,23 +913,23 @@ struct hffuse_conn {
 	/** Negotiated minor version */
 	unsigned minor;
 
-	/** Entry on the hffuse_mount_list */
+	/** Entry on the hffuse_conn_list */
 	struct list_head entry;
 
 	/** Device ID from the root super block */
 	dev_t dev;
-
-	/** Dentries in the control filesystem */
-	struct dentry *ctl_dentry[HFFUSE_CTL_NUM_DENTRIES];
-
-	/** number of dentries used in the above array */
-	int ctl_ndents;
 
 	/** Key for lock owner ID scrambling */
 	u32 scramble_key[4];
 
 	/** Version counter for attribute changes */
 	atomic64_t attr_version;
+
+	/** Version counter for evict inode */
+	atomic64_t evict_ctr;
+
+	/* maximum file name length */
+	u32 name_max;
 
 	/** Called on final put */
 	void (*release)(struct hffuse_conn *);
@@ -873,6 +956,33 @@ struct hffuse_conn {
 
 	/* New writepages go into this bucket */
 	struct hffuse_sync_bucket __rcu *curr_bucket;
+
+#ifdef CONFIG_HFFUSE_PASSTHROUGH
+	/** IDR for backing files ids */
+	struct idr backing_files_map;
+#endif
+
+#ifdef CONFIG_HFFUSE_IO_URING
+	/**  uring connection information*/
+	struct hffuse_ring *ring;
+#endif
+
+	/** Only used if the connection opts into request timeouts */
+	struct {
+		/* Worker for checking if any requests have timed out */
+		struct delayed_work work;
+
+		/* Request timeout (in jiffies). 0 = no timeout */
+		unsigned int req_timeout;
+	} timeout;
+
+	/*
+	 * This is a workaround until hffuse uses iomap for reads.
+	 * For hffuseblk servers, this represents the blocksize passed in at
+	 * mount time and for regular hffuse servers, this is equivalent to
+	 * inode->i_blkbits.
+	 */
+	u8 blkbits;
 };
 
 /*
@@ -896,6 +1006,19 @@ struct hffuse_mount {
 	struct list_head fc_entry;
 	struct rcu_head rcu;
 };
+
+/*
+ * Empty header for HFFUSE opcodes without specific header needs.
+ * Used as a placeholder in args->in_args[0] for consistency
+ * across all HFFUSE operations, simplifying request handling.
+ */
+struct hffuse_zero_header {};
+
+static inline void hffuse_set_zero_arg0(struct hffuse_args *args)
+{
+	args->in_args[0].size = sizeof(struct hffuse_zero_header);
+	args->in_args[0].value = NULL;
+}
 
 static inline struct hffuse_mount *get_hffuse_mount_super(struct super_block *sb)
 {
@@ -937,6 +1060,11 @@ static inline u64 hffuse_get_attr_version(struct hffuse_conn *fc)
 	return atomic64_read(&fc->attr_version);
 }
 
+static inline u64 hffuse_get_evict_ctr(struct hffuse_conn *fc)
+{
+	return atomic64_read(&fc->evict_ctr);
+}
+
 static inline bool hffuse_stale_inode(const struct inode *inode, int generation,
 				    struct hffuse_attr *attr)
 {
@@ -954,25 +1082,25 @@ static inline bool hffuse_is_bad(struct inode *inode)
 	return unlikely(test_bit(HFFUSE_I_BAD, &get_hffuse_inode(inode)->state));
 }
 
-static inline struct page **hffuse_pages_alloc(unsigned int npages, gfp_t flags,
-					     struct hffuse_page_desc **desc)
+static inline struct folio **hffuse_folios_alloc(unsigned int nfolios, gfp_t flags,
+					       struct hffuse_folio_desc **desc)
 {
-	struct page **pages;
+	struct folio **folios;
 
-	pages = kzalloc(npages * (sizeof(struct page *) +
-				  sizeof(struct hffuse_page_desc)), flags);
-	*desc = (void *) (pages + npages);
+	folios = kzalloc(nfolios * (sizeof(struct folio *) +
+				    sizeof(struct hffuse_folio_desc)), flags);
+	*desc = (void *) (folios + nfolios);
 
-	return pages;
+	return folios;
 }
 
-static inline void hffuse_page_descs_length_init(struct hffuse_page_desc *descs,
-					       unsigned int index,
-					       unsigned int nr_pages)
+static inline void hffuse_folio_descs_length_init(struct hffuse_folio_desc *descs,
+						unsigned int index,
+						unsigned int nr_folios)
 {
 	int i;
 
-	for (i = index; i < index + nr_pages; i++)
+	for (i = index; i < index + nr_folios; i++)
 		descs[i].length = PAGE_SIZE - descs[i].offset;
 }
 
@@ -989,14 +1117,14 @@ static inline void hffuse_sync_bucket_dec(struct hffuse_sync_bucket *bucket)
 extern const struct file_operations hffuse_dev_operations;
 
 extern const struct dentry_operations hffuse_dentry_operations;
-extern const struct dentry_operations hffuse_root_dentry_operations;
 
 /**
  * Get a filled in inode
  */
 struct inode *hffuse_iget(struct super_block *sb, u64 nodeid,
 			int generation, struct hffuse_attr *attr,
-			u64 attr_valid, u64 attr_version);
+			u64 attr_valid, u64 attr_version,
+			u64 evict_ctr);
 
 int hffuse_lookup_name(struct super_block *sb, u64 nodeid, const struct qstr *name,
 		     struct hffuse_entry_out *outarg, struct inode **inode);
@@ -1008,10 +1136,6 @@ void hffuse_queue_forget(struct hffuse_conn *fc, struct hffuse_forget_link *forg
 		       u64 nodeid, u64 nlookup);
 
 struct hffuse_forget_link *hffuse_alloc_forget(void);
-
-struct hffuse_forget_link *hffuse_dequeue_forget(struct hffuse_iqueue *fiq,
-					     unsigned int max,
-					     unsigned int *countp);
 
 /*
  * Initialize READ or READDIR request
@@ -1025,7 +1149,7 @@ struct hffuse_io_args {
 		struct {
 			struct hffuse_write_in in;
 			struct hffuse_write_out out;
-			bool page_locked;
+			bool folio_locked;
 		} write;
 	};
 	struct hffuse_args_pages ap;
@@ -1037,14 +1161,9 @@ void hffuse_read_args_fill(struct hffuse_io_args *ia, struct file *file, loff_t 
 			 size_t count, int opcode);
 
 
-/**
- * Send OPEN or OPENDIR request
- */
-int hffuse_open_common(struct inode *inode, struct file *file, bool isdir);
-
-struct hffuse_file *hffuse_file_alloc(struct hffuse_mount *fm);
+struct hffuse_file *hffuse_file_alloc(struct hffuse_mount *fm, bool release);
 void hffuse_file_free(struct hffuse_file *ff);
-void hffuse_finish_open(struct inode *inode, struct file *file);
+int hffuse_finish_open(struct inode *inode, struct file *file);
 
 void hffuse_sync_release(struct hffuse_inode *fi, struct hffuse_file *ff,
 		       unsigned int flags);
@@ -1095,7 +1214,8 @@ void hffuse_change_attributes(struct inode *inode, struct hffuse_attr *attr,
 
 void hffuse_change_attributes_common(struct inode *inode, struct hffuse_attr *attr,
 				   struct hffuse_statx *sx,
-				   u64 attr_valid, u32 cache_mask);
+				   u64 attr_valid, u32 cache_mask,
+				   u64 evict_ctr);
 
 u32 hffuse_get_cache_mask(struct inode *inode);
 
@@ -1115,7 +1235,22 @@ void __exit hffuse_ctl_cleanup(void);
 /**
  * Simple request sending that does request allocation and freeing
  */
-ssize_t hffuse_simple_request(struct hffuse_mount *fm, struct hffuse_args *args);
+ssize_t __hffuse_simple_request(struct mnt_idmap *idmap,
+			      struct hffuse_mount *fm,
+			      struct hffuse_args *args);
+
+static inline ssize_t hffuse_simple_request(struct hffuse_mount *fm, struct hffuse_args *args)
+{
+	return __hffuse_simple_request(&invalid_mnt_idmap, fm, args);
+}
+
+static inline ssize_t hffuse_simple_idmap_request(struct mnt_idmap *idmap,
+						struct hffuse_mount *fm,
+						struct hffuse_args *args)
+{
+	return __hffuse_simple_request(idmap, fm, args);
+}
+
 int hffuse_simple_background(struct hffuse_mount *fm, struct hffuse_args *args,
 			   gfp_t gfp_flags);
 
@@ -1127,6 +1262,9 @@ void hffuse_request_end(struct hffuse_req *req);
 /* Abort all requests */
 void hffuse_abort_conn(struct hffuse_conn *fc);
 void hffuse_wait_aborted(struct hffuse_conn *fc);
+
+/* Check if any requests timed out */
+void hffuse_check_timeout(struct work_struct *work);
 
 /**
  * Invalidate inode attributes
@@ -1155,6 +1293,11 @@ void hffuse_change_entry_timeout(struct dentry *entry, struct hffuse_entry_out *
  * Acquire reference to hffuse_conn
  */
 struct hffuse_conn *hffuse_conn_get(struct hffuse_conn *fc);
+
+/**
+ * Initialize the hffuse processing queue
+ */
+void hffuse_pqueue_init(struct hffuse_pqueue *fpq);
 
 /**
  * Initialize hffuse_conn
@@ -1291,8 +1434,8 @@ bool hffuse_write_update_attr(struct inode *inode, loff_t pos, ssize_t written);
 int hffuse_flush_times(struct inode *inode, struct hffuse_file *ff);
 int hffuse_write_inode(struct inode *inode, struct writeback_control *wbc);
 
-int hffuse_do_setattr(struct dentry *dentry, struct iattr *attr,
-		    struct file *file);
+int hffuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+		    struct iattr *attr, struct file *file);
 
 void hffuse_set_initialized(struct hffuse_conn *fc);
 
@@ -1350,15 +1493,95 @@ void hffuse_dax_cancel_work(struct hffuse_conn *fc);
 long hffuse_file_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
 long hffuse_file_compat_ioctl(struct file *file, unsigned int cmd,
 			    unsigned long arg);
-int hffuse_fileattr_get(struct dentry *dentry, struct fileattr *fa);
+int hffuse_fileattr_get(struct dentry *dentry, struct file_kattr *fa);
 int hffuse_fileattr_set(struct mnt_idmap *idmap,
-		      struct dentry *dentry, struct fileattr *fa);
+		      struct dentry *dentry, struct file_kattr *fa);
+
+/* iomode.c */
+int hffuse_file_cached_io_open(struct inode *inode, struct hffuse_file *ff);
+int hffuse_inode_uncached_io_start(struct hffuse_inode *fi,
+				 struct hffuse_backing *fb);
+void hffuse_inode_uncached_io_end(struct hffuse_inode *fi);
+
+int hffuse_file_io_open(struct file *file, struct inode *inode);
+void hffuse_file_io_release(struct hffuse_file *ff, struct inode *inode);
 
 /* file.c */
-
 struct hffuse_file *hffuse_file_open(struct hffuse_mount *fm, u64 nodeid,
 				 unsigned int open_flags, bool isdir);
 void hffuse_file_release(struct inode *inode, struct hffuse_file *ff,
 		       unsigned int open_flags, fl_owner_t id, bool isdir);
+
+/* passthrough.c */
+static inline struct hffuse_backing *hffuse_inode_backing(struct hffuse_inode *fi)
+{
+#ifdef CONFIG_HFFUSE_PASSTHROUGH
+	return READ_ONCE(fi->fb);
+#else
+	return NULL;
+#endif
+}
+
+static inline struct hffuse_backing *hffuse_inode_backing_set(struct hffuse_inode *fi,
+							  struct hffuse_backing *fb)
+{
+#ifdef CONFIG_HFFUSE_PASSTHROUGH
+	return xchg(&fi->fb, fb);
+#else
+	return NULL;
+#endif
+}
+
+#ifdef CONFIG_HFFUSE_PASSTHROUGH
+struct hffuse_backing *hffuse_backing_get(struct hffuse_backing *fb);
+void hffuse_backing_put(struct hffuse_backing *fb);
+#else
+
+static inline struct hffuse_backing *hffuse_backing_get(struct hffuse_backing *fb)
+{
+	return NULL;
+}
+
+static inline void hffuse_backing_put(struct hffuse_backing *fb)
+{
+}
+#endif
+
+void hffuse_backing_files_init(struct hffuse_conn *fc);
+void hffuse_backing_files_free(struct hffuse_conn *fc);
+int hffuse_backing_open(struct hffuse_conn *fc, struct hffuse_backing_map *map);
+int hffuse_backing_close(struct hffuse_conn *fc, int backing_id);
+
+struct hffuse_backing *hffuse_passthrough_open(struct file *file,
+					   struct inode *inode,
+					   int backing_id);
+void hffuse_passthrough_release(struct hffuse_file *ff, struct hffuse_backing *fb);
+
+static inline struct file *hffuse_file_passthrough(struct hffuse_file *ff)
+{
+#ifdef CONFIG_HFFUSE_PASSTHROUGH
+	return ff->passthrough;
+#else
+	return NULL;
+#endif
+}
+
+ssize_t hffuse_passthrough_read_iter(struct kiocb *iocb, struct iov_iter *iter);
+ssize_t hffuse_passthrough_write_iter(struct kiocb *iocb, struct iov_iter *iter);
+ssize_t hffuse_passthrough_splice_read(struct file *in, loff_t *ppos,
+				     struct pipe_inode_info *pipe,
+				     size_t len, unsigned int flags);
+ssize_t hffuse_passthrough_splice_write(struct pipe_inode_info *pipe,
+				      struct file *out, loff_t *ppos,
+				      size_t len, unsigned int flags);
+ssize_t hffuse_passthrough_mmap(struct file *file, struct vm_area_struct *vma);
+
+#ifdef CONFIG_SYSCTL
+extern int hffuse_sysctl_register(void);
+extern void hffuse_sysctl_unregister(void);
+#else
+#define hffuse_sysctl_register()		(0)
+#define hffuse_sysctl_unregister()	do { } while (0)
+#endif /* CONFIG_SYSCTL */
 
 #endif /* _FS_HFFUSE_I_H */
