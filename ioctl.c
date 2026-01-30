@@ -502,7 +502,7 @@ static void hffuse_priv_ioctl_cleanup(struct inode *inode, struct hffuse_file *f
 	hffuse_file_release(inode, ff, O_RDONLY, NULL, S_ISDIR(inode->i_mode));
 }
 
-int hffuse_fileattr_get(struct dentry *dentry, struct file_kattr *fa)
+int hffuse_fileattr_get(struct dentry *dentry, struct fileattr *fa)
 {
 	struct inode *inode = d_inode(dentry);
 	struct hffuse_file *ff;
@@ -536,13 +536,11 @@ int hffuse_fileattr_get(struct dentry *dentry, struct file_kattr *fa)
 cleanup:
 	hffuse_priv_ioctl_cleanup(inode, ff);
 
-	if (err == -ENOTTY)
-		err = -EOPNOTSUPP;
 	return err;
 }
 
 int hffuse_fileattr_set(struct mnt_idmap *idmap,
-		      struct dentry *dentry, struct file_kattr *fa)
+		      struct dentry *dentry, struct fileattr *fa)
 {
 	struct inode *inode = d_inode(dentry);
 	struct hffuse_file *ff;
@@ -574,7 +572,5 @@ int hffuse_fileattr_set(struct mnt_idmap *idmap,
 cleanup:
 	hffuse_priv_ioctl_cleanup(inode, ff);
 
-	if (err == -ENOTTY)
-		err = -EOPNOTSUPP;
 	return err;
 }

@@ -143,7 +143,6 @@ int hffuse_uring_cmd(struct io_uring_cmd *cmd, unsigned int issue_flags);
 void hffuse_uring_queue_hffuse_req(struct hffuse_iqueue *fiq, struct hffuse_req *req);
 bool hffuse_uring_queue_bq_req(struct hffuse_req *req);
 bool hffuse_uring_remove_pending_req(struct hffuse_req *req);
-bool hffuse_uring_request_expired(struct hffuse_conn *fc);
 
 static inline void hffuse_uring_abort(struct hffuse_conn *fc)
 {
@@ -174,6 +173,12 @@ static inline bool hffuse_uring_ready(struct hffuse_conn *fc)
 
 #else /* CONFIG_HFFUSE_IO_URING */
 
+struct hffuse_ring;
+
+static inline void hffuse_uring_create(struct hffuse_conn *fc)
+{
+}
+
 static inline void hffuse_uring_destruct(struct hffuse_conn *fc)
 {
 }
@@ -197,11 +202,6 @@ static inline bool hffuse_uring_ready(struct hffuse_conn *fc)
 }
 
 static inline bool hffuse_uring_remove_pending_req(struct hffuse_req *req)
-{
-	return false;
-}
-
-static inline bool hffuse_uring_request_expired(struct hffuse_conn *fc)
 {
 	return false;
 }

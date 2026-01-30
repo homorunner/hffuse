@@ -9,7 +9,6 @@
 #include "hffuse_i.h"
 #include "dev_uring_i.h"
 
-#include <linux/dax.h>
 #include <linux/pagemap.h>
 #include <linux/slab.h>
 #include <linux/file.h>
@@ -38,11 +37,8 @@ DEFINE_MUTEX(hffuse_mutex);
 static int set_global_limit(const char *val, const struct kernel_param *kp);
 
 unsigned int hffuse_max_pages_limit = 256;
-/* default is no timeout */
-unsigned int hffuse_default_req_timeout;
-unsigned int hffuse_max_req_timeout;
 
-unsigned int max_user_bgreq;
+unsigned max_user_bgreq;
 module_param_call(max_user_bgreq, set_global_limit, param_get_uint,
 		  &max_user_bgreq, 0644);
 __MODULE_PARM_TYPE(max_user_bgreq, "uint");
@@ -50,7 +46,7 @@ MODULE_PARM_DESC(max_user_bgreq,
  "Global limit for the maximum number of backgrounded requests an "
  "unprivileged user can set");
 
-unsigned int max_user_congthresh;
+unsigned max_user_congthresh;
 module_param_call(max_user_congthresh, set_global_limit, param_get_uint,
 		  &max_user_congthresh, 0644);
 __MODULE_PARM_TYPE(max_user_congthresh, "uint");
@@ -162,9 +158,6 @@ static void hffuse_evict_inode(struct inode *inode)
 
 	/* Will write inode on close/munmap and in all other dirtiers */
 	WARN_ON(inode->i_state & I_DIRTY_INODE);
-
-	if (HFFUSE_IS_DAX(inode))
-		dax_break_layout_final(inode);
 
 	truncate_inode_pages_final(&inode->i_data);
 	clear_inode(inode);
@@ -289,10 +282,10 @@ void hffuse_change_attributes_common(struct inode *inode, struct hffuse_attr *at
 		}
 	}
 
-	if (attr->blksize)
-		fi->cached_i_blkbits = ilog2(attr->blksize);
+	if (attr->blksize != 0)
+		inode->i_blkbits = ilog2(attr->blksize);
 	else
-		fi->cached_i_blkbits = fc->blkbits;
+		inode->i_blkbits = inode->i_sb->s_blocksize_bits;
 
 	/*
 	 * Don't set the sticky bit in i_mode, unless we want the VFS
@@ -966,7 +959,6 @@ void hffuse_conn_init(struct hffuse_conn *fc, struct hffuse_mount *fm,
 	init_rwsem(&fc->killsb);
 	refcount_set(&fc->count, 1);
 	atomic_set(&fc->dev_count, 1);
-	atomic_set(&fc->epoch, 1);
 	init_waitqueue_head(&fc->blocked_waitq);
 	hffuse_iqueue_init(&fc->iq, fiq_ops, fiq_priv);
 	INIT_LIST_HEAD(&fc->bg_queue);
@@ -987,8 +979,6 @@ void hffuse_conn_init(struct hffuse_conn *fc, struct hffuse_mount *fm,
 	fc->user_ns = get_user_ns(user_ns);
 	fc->max_pages = HFFUSE_DEFAULT_MAX_PAGES_PER_REQ;
 	fc->max_pages_limit = hffuse_max_pages_limit;
-	fc->name_max = HFFUSE_NAME_LOW_MAX;
-	fc->timeout.req_timeout = 0;
 
 	if (IS_ENABLED(CONFIG_HFFUSE_PASSTHROUGH))
 		hffuse_backing_files_init(fc);
@@ -1017,8 +1007,6 @@ void hffuse_conn_put(struct hffuse_conn *fc)
 
 		if (IS_ENABLED(CONFIG_HFFUSE_DAX))
 			hffuse_dax_conn_free(fc);
-		if (fc->timeout.req_timeout)
-			cancel_delayed_work_sync(&fc->timeout.work);
 		if (fiq->ops->release)
 			fiq->ops->release(fiq);
 		put_pid_ns(fc->pid_ns);
@@ -1041,7 +1029,7 @@ struct hffuse_conn *hffuse_conn_get(struct hffuse_conn *fc)
 }
 EXPORT_SYMBOL_GPL(hffuse_conn_get);
 
-static struct inode *hffuse_get_root_inode(struct super_block *sb, unsigned int mode)
+static struct inode *hffuse_get_root_inode(struct super_block *sb, unsigned mode)
 {
 	struct hffuse_attr attr;
 	memset(&attr, 0, sizeof(attr));
@@ -1216,7 +1204,7 @@ static const struct super_operations hffuse_super_operations = {
 	.show_options	= hffuse_show_options,
 };
 
-static void sanitize_global_limit(unsigned int *limit)
+static void sanitize_global_limit(unsigned *limit)
 {
 	/*
 	 * The default maximum number of async requests is calculated to consume
@@ -1237,7 +1225,7 @@ static int set_global_limit(const char *val, const struct kernel_param *kp)
 	if (rv)
 		return rv;
 
-	sanitize_global_limit((unsigned int *)kp->arg);
+	sanitize_global_limit((unsigned *)kp->arg);
 
 	return 0;
 }
@@ -1269,34 +1257,6 @@ static void process_init_limits(struct hffuse_conn *fc, struct hffuse_init_out *
 	spin_unlock(&fc->bg_lock);
 }
 
-static void set_request_timeout(struct hffuse_conn *fc, unsigned int timeout)
-{
-	fc->timeout.req_timeout = secs_to_jiffies(timeout);
-	INIT_DELAYED_WORK(&fc->timeout.work, hffuse_check_timeout);
-	queue_delayed_work(system_wq, &fc->timeout.work,
-			   hffuse_timeout_timer_freq);
-}
-
-static void init_server_timeout(struct hffuse_conn *fc, unsigned int timeout)
-{
-	if (!timeout && !hffuse_max_req_timeout && !hffuse_default_req_timeout)
-		return;
-
-	if (!timeout)
-		timeout = hffuse_default_req_timeout;
-
-	if (hffuse_max_req_timeout) {
-		if (timeout)
-			timeout = min(hffuse_max_req_timeout, timeout);
-		else
-			timeout = hffuse_max_req_timeout;
-	}
-
-	timeout = max(HFFUSE_TIMEOUT_TIMER_FREQ, timeout);
-
-	set_request_timeout(fc, timeout);
-}
-
 struct hffuse_init_args {
 	struct hffuse_args args;
 	struct hffuse_init_in in;
@@ -1315,7 +1275,6 @@ static void process_init_reply(struct hffuse_mount *fm, struct hffuse_args *args
 		ok = false;
 	else {
 		unsigned long ra_pages;
-		unsigned int timeout = 0;
 
 		process_init_limits(fc, arg);
 
@@ -1379,13 +1338,6 @@ static void process_init_reply(struct hffuse_mount *fm, struct hffuse_args *args
 				fc->max_pages =
 					min_t(unsigned int, fc->max_pages_limit,
 					max_t(unsigned int, arg->max_pages, 1));
-
-				/*
-				 * PATH_MAX file names might need two pages for
-				 * ops like rename
-				 */
-				if (fc->max_pages > 1)
-					fc->name_max = HFFUSE_NAME_MAX;
 			}
 			if (IS_ENABLED(CONFIG_HFFUSE_DAX)) {
 				if (flags & HFFUSE_MAP_ALIGNMENT &&
@@ -1440,16 +1392,11 @@ static void process_init_reply(struct hffuse_mount *fm, struct hffuse_args *args
 			}
 			if (flags & HFFUSE_OVER_IO_URING && hffuse_uring_enabled())
 				fc->io_uring = 1;
-
-			if (flags & HFFUSE_REQUEST_TIMEOUT)
-				timeout = arg->request_timeout;
 		} else {
 			ra_pages = fc->max_read / PAGE_SIZE;
 			fc->no_lock = 1;
 			fc->no_flock = 1;
 		}
-
-		init_server_timeout(fc, timeout);
 
 		fm->sb->s_bdi->ra_pages = ra_pages;
 		fc->minor = arg->minor;
@@ -1491,8 +1438,7 @@ void hffuse_send_init(struct hffuse_mount *fm)
 		HFFUSE_HANDLE_KILLPRIV_V2 | HFFUSE_SETXATTR_EXT | HFFUSE_INIT_EXT |
 		HFFUSE_SECURITY_CTX | HFFUSE_CREATE_SUPP_GROUP |
 		HFFUSE_HAS_EXPIRE_ONLY | HFFUSE_DIRECT_IO_ALLOW_MMAP |
-		HFFUSE_NO_EXPORT_SUPPORT | HFFUSE_HAS_RESEND | HFFUSE_ALLOW_IDMAP |
-		HFFUSE_REQUEST_TIMEOUT;
+		HFFUSE_NO_EXPORT_SUPPORT | HFFUSE_HAS_RESEND | HFFUSE_ALLOW_IDMAP;
 #ifdef CONFIG_HFFUSE_DAX
 	if (fm->fc->dax)
 		flags |= HFFUSE_MAP_ALIGNMENT;
@@ -1718,7 +1664,7 @@ static int hffuse_fill_super_submount(struct super_block *sb,
 	fi = get_hffuse_inode(root);
 	fi->nlookup--;
 
-	set_default_d_op(sb, &hffuse_dentry_operations);
+	sb->s_d_op = &hffuse_dentry_operations;
 	sb->s_root = d_make_root(root);
 	if (!sb->s_root)
 		return -ENOMEM;
@@ -1809,21 +1755,10 @@ int hffuse_fill_super_common(struct super_block *sb, struct hffuse_fs_context *c
 		err = -EINVAL;
 		if (!sb_set_blocksize(sb, ctx->blksize))
 			goto err;
-		/*
-		 * This is a workaround until hffuse hooks into iomap for reads.
-		 * Use PAGE_SIZE for the blocksize else if the writeback cache
-		 * is enabled, buffered writes go through iomap and a read may
-		 * overwrite partially written data if blocksize < PAGE_SIZE
-		 */
-		fc->blkbits = sb->s_blocksize_bits;
-		if (ctx->blksize != PAGE_SIZE &&
-		    !sb_set_blocksize(sb, PAGE_SIZE))
-			goto err;
 #endif
 	} else {
 		sb->s_blocksize = PAGE_SIZE;
 		sb->s_blocksize_bits = PAGE_SHIFT;
-		fc->blkbits = sb->s_blocksize_bits;
 	}
 
 	sb->s_subtype = ctx->subtype;
@@ -1864,10 +1799,12 @@ int hffuse_fill_super_common(struct super_block *sb, struct hffuse_fs_context *c
 
 	err = -ENOMEM;
 	root = hffuse_get_root_inode(sb, ctx->rootmode);
-	set_default_d_op(sb, &hffuse_dentry_operations);
+	sb->s_d_op = &hffuse_root_dentry_operations;
 	root_dentry = d_make_root(root);
 	if (!root_dentry)
 		goto err_dev_free;
+	/* Root dentry doesn't have .d_revalidate */
+	sb->s_d_op = &hffuse_dentry_operations;
 
 	mutex_lock(&hffuse_mutex);
 	err = -EINVAL;

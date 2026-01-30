@@ -120,7 +120,7 @@ static bool hffuse_emit(struct file *file, struct dir_context *ctx,
 		hffuse_add_dirent_to_cache(file, dirent, ctx->pos);
 
 	return dir_emit(ctx, dirent->name, dirent->namelen, dirent->ino,
-			dirent->type | FILLDIR_FLAG_NOINTR);
+			dirent->type);
 }
 
 static int parse_dirfile(char *buf, size_t nbytes, struct file *file,
@@ -161,7 +161,6 @@ static int hffuse_direntplus_link(struct file *file,
 	struct hffuse_conn *fc;
 	struct inode *inode;
 	DECLARE_WAIT_QUEUE_HEAD_ONSTACK(wq);
-	int epoch;
 
 	if (!o->nodeid) {
 		/*
@@ -191,7 +190,6 @@ static int hffuse_direntplus_link(struct file *file,
 		return -EIO;
 
 	fc = get_hffuse_conn(dir);
-	epoch = atomic_read(&fc->epoch);
 
 	name.hash = full_name_hash(parent, name.name, name.len);
 	dentry = d_lookup(parent, &name);
@@ -258,7 +256,6 @@ retry:
 	}
 	if (fc->readdirplus_auto)
 		set_bit(HFFUSE_I_INIT_RDPLUS, &get_hffuse_inode(inode)->state);
-	dentry->d_time = epoch;
 	hffuse_change_entry_timeout(dentry, o);
 
 	dput(dentry);
@@ -335,32 +332,35 @@ static int hffuse_readdir_uncached(struct file *file, struct dir_context *ctx)
 {
 	int plus;
 	ssize_t res;
+	struct folio *folio;
 	struct inode *inode = file_inode(file);
 	struct hffuse_mount *fm = get_hffuse_mount(inode);
-	struct hffuse_conn *fc = fm->fc;
 	struct hffuse_io_args ia = {};
-	struct hffuse_args *args = &ia.ap.args;
-	void *buf;
-	size_t bufsize = clamp((unsigned int) ctx->count, PAGE_SIZE, fc->max_pages << PAGE_SHIFT);
+	struct hffuse_args_pages *ap = &ia.ap;
+	struct hffuse_folio_desc desc = { .length = PAGE_SIZE };
 	u64 attr_version = 0, evict_ctr = 0;
 	bool locked;
 
-	buf = kvmalloc(bufsize, GFP_KERNEL);
-	if (!buf)
+	folio = folio_alloc(GFP_KERNEL, 0);
+	if (!folio)
 		return -ENOMEM;
 
-	args->out_args[0].value = buf;
-
 	plus = hffuse_use_readdirplus(inode, ctx);
+	ap->args.out_pages = true;
+	ap->num_folios = 1;
+	ap->folios = &folio;
+	ap->descs = &desc;
 	if (plus) {
 		attr_version = hffuse_get_attr_version(fm->fc);
 		evict_ctr = hffuse_get_evict_ctr(fm->fc);
-		hffuse_read_args_fill(&ia, file, ctx->pos, bufsize, HFFUSE_READDIRPLUS);
+		hffuse_read_args_fill(&ia, file, ctx->pos, PAGE_SIZE,
+				    HFFUSE_READDIRPLUS);
 	} else {
-		hffuse_read_args_fill(&ia, file, ctx->pos, bufsize, HFFUSE_READDIR);
+		hffuse_read_args_fill(&ia, file, ctx->pos, PAGE_SIZE,
+				    HFFUSE_READDIR);
 	}
 	locked = hffuse_lock_inode(inode);
-	res = hffuse_simple_request(fm, args);
+	res = hffuse_simple_request(fm, &ap->args);
 	hffuse_unlock_inode(inode, locked);
 	if (res >= 0) {
 		if (!res) {
@@ -369,14 +369,16 @@ static int hffuse_readdir_uncached(struct file *file, struct dir_context *ctx)
 			if (ff->open_flags & FOPEN_CACHE_DIR)
 				hffuse_readdir_cache_end(file, ctx->pos);
 		} else if (plus) {
-			res = parse_dirplusfile(buf, res, file, ctx, attr_version,
+			res = parse_dirplusfile(folio_address(folio), res,
+						file, ctx, attr_version,
 						evict_ctr);
 		} else {
-			res = parse_dirfile(buf, res, file, ctx);
+			res = parse_dirfile(folio_address(folio), res, file,
+					    ctx);
 		}
 	}
 
-	kvfree(buf);
+	folio_put(folio);
 	hffuse_invalidate_atime(inode);
 	return res;
 }
@@ -417,7 +419,7 @@ static enum hffuse_parse_result hffuse_parse_cache(struct hffuse_file *ff,
 		if (ff->readdir.pos == ctx->pos) {
 			res = FOUND_SOME;
 			if (!dir_emit(ctx, dirent->name, dirent->namelen,
-				      dirent->ino, dirent->type | FILLDIR_FLAG_NOINTR))
+				      dirent->ino, dirent->type))
 				return FOUND_ALL;
 			ctx->pos = dirent->off;
 		}

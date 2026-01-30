@@ -140,49 +140,6 @@ void hffuse_uring_abort_end_requests(struct hffuse_ring *ring)
 	}
 }
 
-static bool ent_list_request_expired(struct hffuse_conn *fc, struct list_head *list)
-{
-	struct hffuse_ring_ent *ent;
-	struct hffuse_req *req;
-
-	ent = list_first_entry_or_null(list, struct hffuse_ring_ent, list);
-	if (!ent)
-		return false;
-
-	req = ent->hffuse_req;
-
-	return time_is_before_jiffies(req->create_time +
-				      fc->timeout.req_timeout);
-}
-
-bool hffuse_uring_request_expired(struct hffuse_conn *fc)
-{
-	struct hffuse_ring *ring = fc->ring;
-	struct hffuse_ring_queue *queue;
-	int qid;
-
-	if (!ring)
-		return false;
-
-	for (qid = 0; qid < ring->nr_queues; qid++) {
-		queue = READ_ONCE(ring->queues[qid]);
-		if (!queue)
-			continue;
-
-		spin_lock(&queue->lock);
-		if (hffuse_request_expired(fc, &queue->hffuse_req_queue) ||
-		    hffuse_request_expired(fc, &queue->hffuse_req_bg_queue) ||
-		    ent_list_request_expired(fc, &queue->ent_w_req_queue) ||
-		    ent_list_request_expired(fc, &queue->ent_in_userspace)) {
-			spin_unlock(&queue->lock);
-			return true;
-		}
-		spin_unlock(&queue->lock);
-	}
-
-	return false;
-}
-
 void hffuse_uring_destruct(struct hffuse_conn *fc)
 {
 	struct hffuse_ring *ring = fc->ring;
@@ -254,6 +211,7 @@ static struct hffuse_ring *hffuse_uring_create(struct hffuse_conn *fc)
 	ring->nr_queues = nr_queues;
 	ring->fc = fc;
 	ring->max_payload_sz = max_payload_size;
+	atomic_set(&ring->queue_refs, 0);
 	smp_store_release(&fc->ring, ring);
 
 	spin_unlock(&fc->lock);
@@ -510,7 +468,7 @@ static void hffuse_uring_cancel(struct io_uring_cmd *cmd,
 	spin_lock(&queue->lock);
 	if (ent->state == FRRS_AVAILABLE) {
 		ent->state = FRRS_USERSPACE;
-		list_move_tail(&ent->list, &queue->ent_in_userspace);
+		list_move(&ent->list, &queue->ent_in_userspace);
 		need_cmd_done = true;
 		ent->cmd = NULL;
 	}
@@ -593,8 +551,8 @@ static int hffuse_uring_copy_from_ring(struct hffuse_ring *ring,
 	if (err)
 		return err;
 
-	hffuse_copy_init(&cs, false, &iter);
-	cs.is_uring = true;
+	hffuse_copy_init(&cs, 0, &iter);
+	cs.is_uring = 1;
 	cs.req = req;
 
 	return hffuse_copy_out_args(&cs, args, ring_in_out.payload_sz);
@@ -623,8 +581,8 @@ static int hffuse_uring_args_to_ring(struct hffuse_ring *ring, struct hffuse_req
 		return err;
 	}
 
-	hffuse_copy_init(&cs, true, &iter);
-	cs.is_uring = true;
+	hffuse_copy_init(&cs, 1, &iter);
+	cs.is_uring = 1;
 	cs.req = req;
 
 	if (num_args > 0) {
@@ -730,7 +688,7 @@ static int hffuse_uring_send_next_to_ring(struct hffuse_ring_ent *ent,
 	cmd = ent->cmd;
 	ent->cmd = NULL;
 	ent->state = FRRS_USERSPACE;
-	list_move_tail(&ent->list, &queue->ent_in_userspace);
+	list_move(&ent->list, &queue->ent_in_userspace);
 	spin_unlock(&queue->lock);
 
 	io_uring_cmd_done(cmd, 0, 0, issue_flags);
@@ -780,7 +738,7 @@ static void hffuse_uring_add_req_to_ring_ent(struct hffuse_ring_ent *ent,
 	clear_bit(FR_PENDING, &req->flags);
 	ent->hffuse_req = req;
 	ent->state = FRRS_HFFUSE_REQ;
-	list_move_tail(&ent->list, &queue->ent_w_req_queue);
+	list_move(&ent->list, &queue->ent_w_req_queue);
 	hffuse_uring_add_to_pq(ent, req);
 }
 
@@ -1196,7 +1154,7 @@ static void hffuse_uring_send(struct hffuse_ring_ent *ent, struct io_uring_cmd *
 
 	spin_lock(&queue->lock);
 	ent->state = FRRS_USERSPACE;
-	list_move_tail(&ent->list, &queue->ent_in_userspace);
+	list_move(&ent->list, &queue->ent_in_userspace);
 	ent->cmd = NULL;
 	spin_unlock(&queue->lock);
 

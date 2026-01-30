@@ -229,12 +229,6 @@
  *    - HFFUSE_URING_IN_OUT_HEADER_SZ
  *    - HFFUSE_URING_OP_IN_OUT_SZ
  *    - enum hffuse_uring_cmd
- *
- *  7.43
- *  - add HFFUSE_REQUEST_TIMEOUT
- *
- *  7.44
- *  - add HFFUSE_NOTIFY_INC_EPOCH
  */
 
 #ifndef _LINUX_HFFUSE_H
@@ -270,7 +264,7 @@
 #define HFFUSE_KERNEL_VERSION 7
 
 /** Minor version number of this interface */
-#define HFFUSE_KERNEL_MINOR_VERSION 44
+#define HFFUSE_KERNEL_MINOR_VERSION 42
 
 /** The node ID of the root inode */
 #define HFFUSE_ROOT_ID 1
@@ -441,8 +435,6 @@ struct hffuse_file_lock {
  *		    of the request ID indicates resend requests
  * HFFUSE_ALLOW_IDMAP: allow creation of idmapped mounts
  * HFFUSE_OVER_IO_URING: Indicate that client supports io-uring
- * HFFUSE_REQUEST_TIMEOUT: kernel supports timing out requests.
- *			 init_out.request_timeout contains the timeout (in secs)
  */
 #define HFFUSE_ASYNC_READ		(1 << 0)
 #define HFFUSE_POSIX_LOCKS	(1 << 1)
@@ -485,11 +477,11 @@ struct hffuse_file_lock {
 #define HFFUSE_PASSTHROUGH	(1ULL << 37)
 #define HFFUSE_NO_EXPORT_SUPPORT	(1ULL << 38)
 #define HFFUSE_HAS_RESEND		(1ULL << 39)
+
 /* Obsolete alias for HFFUSE_DIRECT_IO_ALLOW_MMAP */
 #define HFFUSE_DIRECT_IO_RELAX	HFFUSE_DIRECT_IO_ALLOW_MMAP
 #define HFFUSE_ALLOW_IDMAP	(1ULL << 40)
 #define HFFUSE_OVER_IO_URING	(1ULL << 41)
-#define HFFUSE_REQUEST_TIMEOUT	(1ULL << 42)
 
 /**
  * CUSE INIT request/reply flags
@@ -674,7 +666,6 @@ enum hffuse_notify_code {
 	HFFUSE_NOTIFY_RETRIEVE = 5,
 	HFFUSE_NOTIFY_DELETE = 6,
 	HFFUSE_NOTIFY_RESEND = 7,
-	HFFUSE_NOTIFY_INC_EPOCH = 8,
 	HFFUSE_NOTIFY_CODE_MAX,
 };
 
@@ -918,8 +909,7 @@ struct hffuse_init_out {
 	uint16_t	map_alignment;
 	uint32_t	flags2;
 	uint32_t	max_stack_depth;
-	uint16_t	request_timeout;
-	uint16_t	unused[11];
+	uint32_t	unused[6];
 };
 
 #define CUSE_INIT_INFO_MAX 4096
@@ -1290,6 +1280,6 @@ struct hffuse_uring_cmd_req {
 	uint8_t padding[6];
 };
 
-#define HFFUSE_MINOR 229
+#define HFFUSE_MINOR 251
 
 #endif /* _LINUX_HFFUSE_H */

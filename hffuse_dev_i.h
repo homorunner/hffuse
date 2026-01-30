@@ -20,6 +20,7 @@ struct hffuse_iqueue;
 struct hffuse_forget_link;
 
 struct hffuse_copy_state {
+	int write;
 	struct hffuse_req *req;
 	struct iov_iter *iter;
 	struct pipe_buffer *pipebufs;
@@ -29,9 +30,8 @@ struct hffuse_copy_state {
 	struct page *pg;
 	unsigned int len;
 	unsigned int offset;
-	bool write:1;
-	bool move_folios:1;
-	bool is_uring:1;
+	unsigned int move_pages:1;
+	unsigned int is_uring:1;
 	struct {
 		unsigned int copied_sz; /* copied size into the user buffer */
 	} ring;
@@ -51,7 +51,7 @@ struct hffuse_req *hffuse_request_find(struct hffuse_pqueue *fpq, u64 unique);
 
 void hffuse_dev_end_requests(struct list_head *head);
 
-void hffuse_copy_init(struct hffuse_copy_state *cs, bool write,
+void hffuse_copy_init(struct hffuse_copy_state *cs, int write,
 			   struct iov_iter *iter);
 int hffuse_copy_args(struct hffuse_copy_state *cs, unsigned int numargs,
 		   unsigned int argpages, struct hffuse_arg *args,
@@ -62,8 +62,6 @@ void hffuse_dev_queue_forget(struct hffuse_iqueue *fiq,
 			   struct hffuse_forget_link *forget);
 void hffuse_dev_queue_interrupt(struct hffuse_iqueue *fiq, struct hffuse_req *req);
 bool hffuse_remove_pending_req(struct hffuse_req *req, spinlock_t *lock);
-
-bool hffuse_request_expired(struct hffuse_conn *fc, struct list_head *list);
 
 #endif
 

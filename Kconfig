@@ -2,7 +2,6 @@
 config HFFUSE_FS
 	tristate "HFFUSE (Filesystem in Userspace) support"
 	select FS_POSIX_ACL
-	select FS_IOMAP
 	help
 	  With HFFUSE it is possible to implement a fully functional filesystem
 	  in a userspace program.

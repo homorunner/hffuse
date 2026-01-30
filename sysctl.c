@@ -13,12 +13,6 @@ static struct ctl_table_header *hffuse_table_header;
 /* Bound by hffuse_init_out max_pages, which is a u16 */
 static unsigned int sysctl_hffuse_max_pages_limit = 65535;
 
-/*
- * hffuse_init_out request timeouts are u16.
- * This goes up to ~18 hours, which is plenty for a timeout.
- */
-static unsigned int sysctl_hffuse_req_timeout_limit = 65535;
-
 static const struct ctl_table hffuse_sysctl_table[] = {
 	{
 		.procname	= "max_pages_limit",
@@ -28,24 +22,6 @@ static const struct ctl_table hffuse_sysctl_table[] = {
 		.proc_handler	= proc_douintvec_minmax,
 		.extra1		= SYSCTL_ONE,
 		.extra2		= &sysctl_hffuse_max_pages_limit,
-	},
-	{
-		.procname	= "default_request_timeout",
-		.data		= &hffuse_default_req_timeout,
-		.maxlen		= sizeof(hffuse_default_req_timeout),
-		.mode		= 0644,
-		.proc_handler	= proc_douintvec_minmax,
-		.extra1		= SYSCTL_ZERO,
-		.extra2		= &sysctl_hffuse_req_timeout_limit,
-	},
-	{
-		.procname	= "max_request_timeout",
-		.data		= &hffuse_max_req_timeout,
-		.maxlen		= sizeof(hffuse_max_req_timeout),
-		.mode		= 0644,
-		.proc_handler	= proc_douintvec_minmax,
-		.extra1		= SYSCTL_ZERO,
-		.extra2		= &sysctl_hffuse_req_timeout_limit,
 	},
 };
 
