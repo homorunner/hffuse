@@ -18,11 +18,11 @@ static void hffuse_file_accessed(struct file *file)
 	hffuse_invalidate_atime(inode);
 }
 
-static void hffuse_passthrough_end_write(struct kiocb *iocb, ssize_t ret)
+static void hffuse_passthrough_end_write(struct file *file, loff_t pos, ssize_t ret)
 {
-	struct inode *inode = file_inode(iocb->ki_filp);
+	struct inode *inode = file_inode(file);
 
-	hffuse_write_update_attr(inode, iocb->ki_pos, ret);
+	hffuse_write_update_attr(inode, pos, ret);
 }
 
 ssize_t hffuse_passthrough_read_iter(struct kiocb *iocb, struct iov_iter *iter)
@@ -34,6 +34,7 @@ ssize_t hffuse_passthrough_read_iter(struct kiocb *iocb, struct iov_iter *iter)
 	ssize_t ret;
 	struct backing_file_ctx ctx = {
 		.cred = ff->cred,
+		.user_file = file,
 		.accessed = hffuse_file_accessed,
 	};
 
@@ -61,6 +62,7 @@ ssize_t hffuse_passthrough_write_iter(struct kiocb *iocb,
 	ssize_t ret;
 	struct backing_file_ctx ctx = {
 		.cred = ff->cred,
+		.user_file = file,
 		.end_write = hffuse_passthrough_end_write,
 	};
 
@@ -86,20 +88,15 @@ ssize_t hffuse_passthrough_splice_read(struct file *in, loff_t *ppos,
 	struct file *backing_file = hffuse_file_passthrough(ff);
 	struct backing_file_ctx ctx = {
 		.cred = ff->cred,
+		.user_file = in,
 		.accessed = hffuse_file_accessed,
 	};
-	struct kiocb iocb;
-	ssize_t ret;
 
 	pr_debug("%s: backing_file=0x%p, pos=%lld, len=%zu, flags=0x%x\n", __func__,
-		 backing_file, *ppos, len, flags);
+		 backing_file, ppos ? *ppos : 0, len, flags);
 
-	init_sync_kiocb(&iocb, in);
-	iocb.ki_pos = *ppos;
-	ret = backing_file_splice_read(backing_file, &iocb, pipe, len, flags, &ctx);
-	*ppos = iocb.ki_pos;
-
-	return ret;
+	return backing_file_splice_read(backing_file, ppos, pipe, len, flags,
+					&ctx);
 }
 
 ssize_t hffuse_passthrough_splice_write(struct pipe_inode_info *pipe,
@@ -112,18 +109,16 @@ ssize_t hffuse_passthrough_splice_write(struct pipe_inode_info *pipe,
 	ssize_t ret;
 	struct backing_file_ctx ctx = {
 		.cred = ff->cred,
+		.user_file = out,
 		.end_write = hffuse_passthrough_end_write,
 	};
-	struct kiocb iocb;
 
 	pr_debug("%s: backing_file=0x%p, pos=%lld, len=%zu, flags=0x%x\n", __func__,
-		 backing_file, *ppos, len, flags);
+		 backing_file, ppos ? *ppos : 0, len, flags);
 
 	inode_lock(inode);
-	init_sync_kiocb(&iocb, out);
-	iocb.ki_pos = *ppos;
-	ret = backing_file_splice_write(pipe, backing_file, &iocb, len, flags, &ctx);
-	*ppos = iocb.ki_pos;
+	ret = backing_file_splice_write(pipe, backing_file, ppos, len, flags,
+					&ctx);
 	inode_unlock(inode);
 
 	return ret;
@@ -135,6 +130,7 @@ ssize_t hffuse_passthrough_mmap(struct file *file, struct vm_area_struct *vma)
 	struct file *backing_file = hffuse_file_passthrough(ff);
 	struct backing_file_ctx ctx = {
 		.cred = ff->cred,
+		.user_file = file,
 		.accessed = hffuse_file_accessed,
 	};
 
@@ -232,10 +228,14 @@ int hffuse_backing_open(struct hffuse_conn *fc, struct hffuse_backing_map *map)
 	if (map->flags || map->padding)
 		goto out;
 
-	file = fget_raw(map->fd);
+	file = fget(map->fd);
 	res = -EBADF;
 	if (!file)
 		goto out;
+
+	res = -EOPNOTSUPP;
+	if (!file->f_op->read_iter || !file->f_op->write_iter)
+		goto out_fput;
 
 	backing_sb = file_inode(file)->i_sb;
 	res = -ELOOP;

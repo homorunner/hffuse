@@ -24,10 +24,6 @@
 #include <linux/splice.h>
 #include <linux/sched.h>
 
-#define CREATE_TRACE_POINTS
-#include "hffuse_trace.h"
-
-MODULE_ALIAS_MISCDEV(HFFUSE_MINOR);
 MODULE_ALIAS("devname:hffuse");
 
 static struct kmem_cache *hffuse_req_cachep;
@@ -96,17 +92,11 @@ static void hffuse_drop_waiting(struct hffuse_conn *fc)
 
 static void hffuse_put_request(struct hffuse_req *req);
 
-static struct hffuse_req *hffuse_get_req(struct mnt_idmap *idmap,
-				     struct hffuse_mount *fm,
-				     bool for_background)
+static struct hffuse_req *hffuse_get_req(struct hffuse_mount *fm, bool for_background)
 {
 	struct hffuse_conn *fc = fm->fc;
 	struct hffuse_req *req;
-	bool no_idmap = !fm->sb || (fm->sb->s_iflags & SB_I_NOIDMAP);
-	kuid_t fsuid;
-	kgid_t fsgid;
 	int err;
-
 	atomic_inc(&fc->num_waiting);
 
 	if (hffuse_block_alloc(fc, for_background)) {
@@ -134,32 +124,19 @@ static struct hffuse_req *hffuse_get_req(struct mnt_idmap *idmap,
 		goto out;
 	}
 
+	req->in.h.uid = from_kuid(fc->user_ns, current_fsuid());
+	req->in.h.gid = from_kgid(fc->user_ns, current_fsgid());
 	req->in.h.pid = pid_nr_ns(task_pid(current), fc->pid_ns);
 
 	__set_bit(FR_WAITING, &req->flags);
 	if (for_background)
 		__set_bit(FR_BACKGROUND, &req->flags);
 
-	/*
-	 * Keep the old behavior when idmappings support was not
-	 * declared by a HFFUSE server.
-	 *
-	 * For those HFFUSE servers who support idmapped mounts,
-	 * we send UID/GID only along with "inode creation"
-	 * hffuse requests, otherwise idmap == &invalid_mnt_idmap and
-	 * req->in.h.{u,g}id will be equal to HFFUSE_INVALID_UIDGID.
-	 */
-	fsuid = no_idmap ? current_fsuid() : mapped_fsuid(idmap, fc->user_ns);
-	fsgid = no_idmap ? current_fsgid() : mapped_fsgid(idmap, fc->user_ns);
-	req->in.h.uid = from_kuid(fc->user_ns, fsuid);
-	req->in.h.gid = from_kgid(fc->user_ns, fsgid);
-
-	if (no_idmap && unlikely(req->in.h.uid == ((uid_t)-1) ||
-				 req->in.h.gid == ((gid_t)-1))) {
+	if (unlikely(req->in.h.uid == ((uid_t)-1) ||
+		     req->in.h.gid == ((gid_t)-1))) {
 		hffuse_put_request(req);
 		return ERR_PTR(-EOVERFLOW);
 	}
-
 	return req;
 
  out:
@@ -301,7 +278,6 @@ static void hffuse_send_one(struct hffuse_iqueue *fiq, struct hffuse_req *req)
 	req->in.h.len = sizeof(struct hffuse_in_header) +
 		hffuse_len_args(req->args->in_numargs,
 			      (struct hffuse_arg *) req->args->in_args);
-	trace_hffuse_request_send(req);
 	fiq->ops->send_req(fiq, req);
 }
 
@@ -316,18 +292,68 @@ void hffuse_queue_forget(struct hffuse_conn *fc, struct hffuse_forget_link *forg
 	fiq->ops->send_forget(fiq, forget);
 }
 
-static void flush_bg_queue(struct hffuse_conn *fc)
+static void hffuse_add_bg_queue(struct hffuse_conn *fc, struct hffuse_req *req)
+{
+	if (fc->separate_background) {
+		if (req->args->opcode == HFFUSE_WRITE)
+			list_add_tail(&req->list, &fc->bg_queue[WRITE]);
+		else
+			list_add_tail(&req->list, &fc->bg_queue[READ]);
+	} else {
+		/* default to one single background queue */
+		list_add_tail(&req->list, &fc->bg_queue[DEFAULT_BG_QUEUE]);
+	}
+}
+
+static void hffuse_dec_active_bg(struct hffuse_conn *fc, struct hffuse_req *req)
+{
+	if (fc->separate_background) {
+		if (req->args->opcode == HFFUSE_WRITE)
+			fc->active_background[WRITE]--;
+		else
+			fc->active_background[READ]--;
+	} else {
+		/* default to one single count */
+		fc->active_background[DEFAULT_BG_QUEUE]--;
+	}
+}
+
+/* bg_queue needs to be further flushed when true returned */
+static bool do_flush_bg_queue(struct hffuse_conn *fc, unsigned int index,
+			      unsigned int batch)
 {
 	struct hffuse_iqueue *fiq = &fc->iq;
+	struct hffuse_req *req;
+	unsigned int count = 0;
 
-	while (fc->active_background < fc->max_background &&
-	       !list_empty(&fc->bg_queue)) {
-		struct hffuse_req *req;
-
-		req = list_first_entry(&fc->bg_queue, struct hffuse_req, list);
+	while (fc->active_background[index] < fc->max_background &&
+	       !list_empty(&fc->bg_queue[index])) {
+		if (batch && count++ == batch)
+			return true;
+		req = list_first_entry(&fc->bg_queue[index],
+				struct hffuse_req, list);
 		list_del(&req->list);
-		fc->active_background++;
+		fc->active_background[index]++;
 		hffuse_send_one(fiq, req);
+	}
+	return false;
+}
+
+static void flush_bg_queue(struct hffuse_conn *fc)
+{
+	if (!fc->separate_background) {
+		do_flush_bg_queue(fc, DEFAULT_BG_QUEUE, 0);
+	} else {
+		bool proceed_write = true, proceed_other = true;
+
+		do {
+			if (proceed_other)
+				proceed_other = do_flush_bg_queue(fc, READ,
+					HFFUSE_DEFAULT_MAX_BACKGROUND);
+			if (proceed_write)
+				proceed_write = do_flush_bg_queue(fc, WRITE,
+					HFFUSE_DEFAULT_MAX_BACKGROUND);
+		} while (proceed_other || proceed_write);
 	}
 }
 
@@ -348,7 +374,6 @@ void hffuse_request_end(struct hffuse_req *req)
 	if (test_and_set_bit(FR_FINISHED, &req->flags))
 		goto put_request;
 
-	trace_hffuse_request_end(req);
 	/*
 	 * test_and_set_bit() implies smp_mb() between bit
 	 * changing and below FR_INTERRUPTED check. Pairs with
@@ -379,7 +404,7 @@ void hffuse_request_end(struct hffuse_req *req)
 		}
 
 		fc->num_background--;
-		fc->active_background--;
+		hffuse_dec_active_bg(fc, req);
 		flush_bg_queue(fc);
 		spin_unlock(&fc->bg_lock);
 	} else {
@@ -522,14 +547,8 @@ static void hffuse_force_creds(struct hffuse_req *req)
 {
 	struct hffuse_conn *fc = req->fm->fc;
 
-	if (!req->fm->sb || req->fm->sb->s_iflags & SB_I_NOIDMAP) {
-		req->in.h.uid = from_kuid_munged(fc->user_ns, current_fsuid());
-		req->in.h.gid = from_kgid_munged(fc->user_ns, current_fsgid());
-	} else {
-		req->in.h.uid = HFFUSE_INVALID_UIDGID;
-		req->in.h.gid = HFFUSE_INVALID_UIDGID;
-	}
-
+	req->in.h.uid = from_kuid_munged(fc->user_ns, current_fsuid());
+	req->in.h.gid = from_kgid_munged(fc->user_ns, current_fsgid());
 	req->in.h.pid = pid_nr_ns(task_pid(current), fc->pid_ns);
 }
 
@@ -544,9 +563,7 @@ static void hffuse_args_to_req(struct hffuse_req *req, struct hffuse_args *args)
 		__set_bit(FR_ASYNC, &req->flags);
 }
 
-ssize_t __hffuse_simple_request(struct mnt_idmap *idmap,
-			      struct hffuse_mount *fm,
-			      struct hffuse_args *args)
+ssize_t hffuse_simple_request(struct hffuse_mount *fm, struct hffuse_args *args)
 {
 	struct hffuse_conn *fc = fm->fc;
 	struct hffuse_req *req;
@@ -563,7 +580,7 @@ ssize_t __hffuse_simple_request(struct mnt_idmap *idmap,
 		__set_bit(FR_FORCE, &req->flags);
 	} else {
 		WARN_ON(args->nocreds);
-		req = hffuse_get_req(idmap, fm, false);
+		req = hffuse_get_req(fm, false);
 		if (IS_ERR(req))
 			return PTR_ERR(req);
 	}
@@ -626,7 +643,7 @@ static int hffuse_request_queue_background(struct hffuse_req *req)
 		fc->num_background++;
 		if (fc->num_background == fc->max_background)
 			fc->blocked = 1;
-		list_add_tail(&req->list, &fc->bg_queue);
+		hffuse_add_bg_queue(fc, req);
 		flush_bg_queue(fc);
 		queued = true;
 	}
@@ -648,7 +665,7 @@ int hffuse_simple_background(struct hffuse_mount *fm, struct hffuse_args *args,
 		__set_bit(FR_BACKGROUND, &req->flags);
 	} else {
 		WARN_ON(args->nocreds);
-		req = hffuse_get_req(&invalid_mnt_idmap, fm, true);
+		req = hffuse_get_req(fm, true);
 		if (IS_ERR(req))
 			return PTR_ERR(req);
 	}
@@ -670,7 +687,7 @@ static int hffuse_simple_notify_reply(struct hffuse_mount *fm,
 	struct hffuse_req *req;
 	struct hffuse_iqueue *fiq = &fm->fc->iq;
 
-	req = hffuse_get_req(&invalid_mnt_idmap, fm, false);
+	req = hffuse_get_req(fm, false);
 	if (IS_ERR(req))
 		return PTR_ERR(req);
 
@@ -842,6 +859,7 @@ static int hffuse_check_folio(struct folio *folio)
 	    (folio->flags & PAGE_FLAGS_CHECK_AT_PREP &
 	     ~(1 << PG_locked |
 	       1 << PG_referenced |
+	       1 << PG_uptodate |
 	       1 << PG_lru |
 	       1 << PG_active |
 	       1 << PG_workingset |
@@ -854,12 +872,6 @@ static int hffuse_check_folio(struct folio *folio)
 	return 0;
 }
 
-/*
- * Attempt to steal a page from the splice() pipe and move it into the
- * pagecache. If successful, the pointer in @pagep will be updated. The
- * folio that was originally in @pagep will lose a reference and the new
- * folio returned in @pagep will carry a reference.
- */
 static int hffuse_try_move_page(struct hffuse_copy_state *cs, struct page **pagep)
 {
 	int err;
@@ -892,7 +904,9 @@ static int hffuse_try_move_page(struct hffuse_copy_state *cs, struct page **page
 
 	newfolio = page_folio(buf->page);
 
-	folio_clear_uptodate(newfolio);
+	if (!folio_test_uptodate(newfolio))
+		folio_mark_uptodate(newfolio);
+
 	folio_clear_mappedtodisk(newfolio);
 
 	if (hffuse_check_folio(newfolio) != 0)
@@ -1052,27 +1066,17 @@ static int hffuse_copy_pages(struct hffuse_copy_state *cs, unsigned nbytes,
 	struct hffuse_req *req = cs->req;
 	struct hffuse_args_pages *ap = container_of(req->args, typeof(*ap), args);
 
-	for (i = 0; i < ap->num_folios && (nbytes || zeroing); i++) {
+
+	for (i = 0; i < ap->num_pages && (nbytes || zeroing); i++) {
 		int err;
 		unsigned int offset = ap->descs[i].offset;
 		unsigned int count = min(nbytes, ap->descs[i].length);
-		struct page *orig, *pagep;
 
-		orig = pagep = &ap->folios[i]->page;
-
-		err = hffuse_copy_page(cs, &pagep, offset, count, zeroing);
+		err = hffuse_copy_page(cs, &ap->pages[i], offset, count, zeroing);
 		if (err)
 			return err;
 
 		nbytes -= count;
-
-		/*
-		 *  hffuse_copy_page may have moved a page from a pipe instead of
-		 *  copying into our given page, so update the folios if it was
-		 *  replaced.
-		 */
-		if (pagep != orig)
-			ap->folios[i] = page_folio(pagep);
 	}
 	return 0;
 }
@@ -1473,7 +1477,7 @@ static ssize_t hffuse_dev_splice_read(struct file *in, loff_t *ppos,
 	if (ret < 0)
 		goto out;
 
-	if (pipe_buf_usage(pipe) + cs.nr_segs > pipe->max_usage) {
+	if (pipe_occupancy(pipe->head, pipe->tail) + cs.nr_segs > pipe->max_usage) {
 		ret = -EIO;
 		goto out;
 	}
@@ -1554,6 +1558,9 @@ static int hffuse_notify_inval_entry(struct hffuse_conn *fc, unsigned int size,
 	struct qstr name;
 
 	buf = kzalloc(HFFUSE_NAME_MAX + 1, GFP_KERNEL);
+	if (!buf)
+		goto err;
+
 	err = -EINVAL;
 	if (size < sizeof(outarg))
 		goto err;
@@ -1599,6 +1606,9 @@ static int hffuse_notify_delete(struct hffuse_conn *fc, unsigned int size,
 	struct qstr name;
 
 	buf = kzalloc(HFFUSE_NAME_MAX + 1, GFP_KERNEL);
+	if (!buf)
+		goto err;
+
 	err = -EINVAL;
 	if (size < sizeof(outarg))
 		goto err;
@@ -1682,25 +1692,24 @@ static int hffuse_notify_store(struct hffuse_conn *fc, unsigned int size,
 
 	num = outarg.size;
 	while (num) {
-		struct folio *folio;
 		struct page *page;
 		unsigned int this_num;
 
-		folio = filemap_grab_folio(mapping, index);
-		err = PTR_ERR(folio);
-		if (IS_ERR(folio))
+		err = -ENOMEM;
+		page = find_or_create_page(mapping, index,
+					   mapping_gfp_mask(mapping));
+		if (!page)
 			goto out_iput;
 
-		page = &folio->page;
-		this_num = min_t(unsigned, num, folio_size(folio) - offset);
+		this_num = min_t(unsigned, num, PAGE_SIZE - offset);
 		err = hffuse_copy_page(cs, &page, offset, this_num, 0);
-		if (!folio_test_uptodate(folio) && !err && offset == 0 &&
-		    (this_num == folio_size(folio) || file_size == end)) {
-			folio_zero_segment(folio, this_num, folio_size(folio));
-			folio_mark_uptodate(folio);
+		if (!PageUptodate(page) && !err && offset == 0 &&
+		    (this_num == PAGE_SIZE || file_size == end)) {
+			zero_user_segment(page, this_num, PAGE_SIZE);
+			SetPageUptodate(page);
 		}
-		folio_unlock(folio);
-		folio_put(folio);
+		unlock_page(page);
+		put_page(page);
 
 		if (err)
 			goto out_iput;
@@ -1732,7 +1741,7 @@ static void hffuse_retrieve_end(struct hffuse_mount *fm, struct hffuse_args *arg
 	struct hffuse_retrieve_args *ra =
 		container_of(args, typeof(*ra), ap.args);
 
-	release_pages(ra->ap.folios, ra->ap.num_folios);
+	release_pages(ra->ap.pages, ra->ap.num_pages);
 	kfree(ra);
 }
 
@@ -1746,7 +1755,7 @@ static int hffuse_retrieve(struct hffuse_mount *fm, struct inode *inode,
 	unsigned int num;
 	unsigned int offset;
 	size_t total_len = 0;
-	unsigned int num_pages, cur_pages = 0;
+	unsigned int num_pages;
 	struct hffuse_conn *fc = fm->fc;
 	struct hffuse_retrieve_args *ra;
 	size_t args_size = sizeof(*ra);
@@ -1765,15 +1774,15 @@ static int hffuse_retrieve(struct hffuse_mount *fm, struct inode *inode,
 	num_pages = (num + offset + PAGE_SIZE - 1) >> PAGE_SHIFT;
 	num_pages = min(num_pages, fc->max_pages);
 
-	args_size += num_pages * (sizeof(ap->folios[0]) + sizeof(ap->descs[0]));
+	args_size += num_pages * (sizeof(ap->pages[0]) + sizeof(ap->descs[0]));
 
 	ra = kzalloc(args_size, GFP_KERNEL);
 	if (!ra)
 		return -ENOMEM;
 
 	ap = &ra->ap;
-	ap->folios = (void *) (ra + 1);
-	ap->descs = (void *) (ap->folios + num_pages);
+	ap->pages = (void *) (ra + 1);
+	ap->descs = (void *) (ap->pages + num_pages);
 
 	args = &ap->args;
 	args->nodeid = outarg->nodeid;
@@ -1784,20 +1793,19 @@ static int hffuse_retrieve(struct hffuse_mount *fm, struct inode *inode,
 
 	index = outarg->offset >> PAGE_SHIFT;
 
-	while (num && cur_pages < num_pages) {
-		struct folio *folio;
+	while (num && ap->num_pages < num_pages) {
+		struct page *page;
 		unsigned int this_num;
 
-		folio = filemap_get_folio(mapping, index);
-		if (IS_ERR(folio))
+		page = find_get_page(mapping, index);
+		if (!page)
 			break;
 
 		this_num = min_t(unsigned, num, PAGE_SIZE - offset);
-		ap->folios[ap->num_folios] = folio;
-		ap->descs[ap->num_folios].offset = offset;
-		ap->descs[ap->num_folios].length = this_num;
-		ap->num_folios++;
-		cur_pages++;
+		ap->pages[ap->num_pages] = page;
+		ap->descs[ap->num_pages].offset = offset;
+		ap->descs[ap->num_pages].length = this_num;
+		ap->num_pages++;
 
 		offset = 0;
 		num -= this_num;
@@ -1868,7 +1876,7 @@ copy_finish:
  * if the HFFUSE daemon takes careful measures to avoid processing duplicated
  * non-idempotent requests.
  */
-static void hffuse_resend(struct hffuse_conn *fc)
+void hffuse_resend(struct hffuse_conn *fc)
 {
 	struct hffuse_dev *fud;
 	struct hffuse_req *req, *next;
@@ -2117,7 +2125,7 @@ static ssize_t hffuse_dev_splice_write(struct pipe_inode_info *pipe,
 				     struct file *out, loff_t *ppos,
 				     size_t len, unsigned int flags)
 {
-	unsigned int head, tail, count;
+	unsigned int head, tail, mask, count;
 	unsigned nbuf;
 	unsigned idx;
 	struct pipe_buffer *bufs;
@@ -2134,7 +2142,8 @@ static ssize_t hffuse_dev_splice_write(struct pipe_inode_info *pipe,
 
 	head = pipe->head;
 	tail = pipe->tail;
-	count = pipe_occupancy(head, tail);
+	mask = pipe->ring_size - 1;
+	count = head - tail;
 
 	bufs = kvmalloc_array(count, sizeof(struct pipe_buffer), GFP_KERNEL);
 	if (!bufs) {
@@ -2144,8 +2153,8 @@ static ssize_t hffuse_dev_splice_write(struct pipe_inode_info *pipe,
 
 	nbuf = 0;
 	rem = 0;
-	for (idx = tail; !pipe_empty(head, idx) && rem < len; idx++)
-		rem += pipe_buf(pipe, idx)->len;
+	for (idx = tail; idx != head && rem < len; idx++)
+		rem += pipe->bufs[idx & mask].len;
 
 	ret = -EINVAL;
 	if (rem < len)
@@ -2156,10 +2165,10 @@ static ssize_t hffuse_dev_splice_write(struct pipe_inode_info *pipe,
 		struct pipe_buffer *ibuf;
 		struct pipe_buffer *obuf;
 
-		if (WARN_ON(nbuf >= count || pipe_empty(head, tail)))
+		if (WARN_ON(nbuf >= count || tail == head))
 			goto out_free;
 
-		ibuf = pipe_buf(pipe, tail);
+		ibuf = &pipe->bufs[tail & mask];
 		obuf = &bufs[nbuf];
 
 		if (rem >= ibuf->len) {
@@ -2383,6 +2392,43 @@ int hffuse_dev_release(struct inode *inode, struct file *file)
 }
 EXPORT_SYMBOL_GPL(hffuse_dev_release);
 
+/*
+ * Flush all pending processing requests.
+ *
+ * The failover procedure reuses the hffuse_conn after a userspace crash and
+ * recovery. However, the requests in the processing queue will never receive a
+ * reply, causing the application to become stuck indefinitely.
+ *
+ * To resolve this issue, we need to flush these requests using the sysfs API.
+ * We only flush the requests in the processing queue, as these requests have
+ * already been sent to userspace. First, we dequeue the request from the
+ * processing queue, and then we call request_end to finalize it.
+ */
+void hffuse_flush_pq(struct hffuse_conn *fc)
+{
+	struct hffuse_dev *fud;
+	LIST_HEAD(to_end);
+	unsigned int i;
+
+	spin_lock(&fc->lock);
+	if (!fc->connected) {
+		spin_unlock(&fc->lock);
+		return;
+	}
+	list_for_each_entry(fud, &fc->devices, entry) {
+		struct hffuse_pqueue *fpq = &fud->pq;
+
+		spin_lock(&fpq->lock);
+		WARN_ON(!list_empty(&fpq->io));
+		for (i = 0; i < HFFUSE_PQ_HASH_SIZE; i++)
+			list_splice_init(&fpq->processing[i], &to_end);
+		spin_unlock(&fpq->lock);
+	}
+	spin_unlock(&fc->lock);
+
+	hffuse_dev_end_requests(&to_end);
+}
+
 static int hffuse_dev_fasync(int fd, struct file *file, int on)
 {
 	struct hffuse_dev *fud = hffuse_get_dev(file);
@@ -2416,20 +2462,21 @@ static long hffuse_dev_ioctl_clone(struct file *file, __u32 __user *argp)
 	int res;
 	int oldfd;
 	struct hffuse_dev *fud = NULL;
+	struct fd f;
 
 	if (get_user(oldfd, argp))
 		return -EFAULT;
 
-	CLASS(fd, f)(oldfd);
-	if (fd_empty(f))
+	f = fdget(oldfd);
+	if (!f.file)
 		return -EINVAL;
 
 	/*
 	 * Check against file->f_op because CUSE
 	 * uses the same ioctl handler.
 	 */
-	if (fd_file(f)->f_op == file->f_op)
-		fud = hffuse_get_dev(fd_file(f));
+	if (f.file->f_op == file->f_op)
+		fud = hffuse_get_dev(f.file);
 
 	res = -EINVAL;
 	if (fud) {
@@ -2438,6 +2485,7 @@ static long hffuse_dev_ioctl_clone(struct file *file, __u32 __user *argp)
 		mutex_unlock(&hffuse_mutex);
 	}
 
+	fdput(f);
 	return res;
 }
 
@@ -2499,6 +2547,7 @@ static long hffuse_dev_ioctl(struct file *file, unsigned int cmd,
 const struct file_operations hffuse_dev_operations = {
 	.owner		= THIS_MODULE,
 	.open		= hffuse_dev_open,
+	.llseek		= no_llseek,
 	.read_iter	= hffuse_dev_read,
 	.splice_read	= hffuse_dev_splice_read,
 	.write_iter	= hffuse_dev_write,
@@ -2515,7 +2564,7 @@ const struct file_operations hffuse_dev_operations = {
 EXPORT_SYMBOL_GPL(hffuse_dev_operations);
 
 static struct miscdevice hffuse_miscdevice = {
-	.minor = HFFUSE_MINOR,
+	.minor = MISC_DYNAMIC_MINOR,
 	.name  = "hffuse",
 	.fops = &hffuse_dev_operations,
 };

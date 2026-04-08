@@ -217,9 +217,7 @@
  *  - add backing_id to hffuse_open_out, add FOPEN_PASSTHROUGH open flag
  *  - add HFFUSE_NO_EXPORT_SUPPORT init flag
  *  - add HFFUSE_NOTIFY_RESEND, add HFFUSE_HAS_RESEND init flag
- *
- *  7.41
- *  - add HFFUSE_ALLOW_IDMAP
+ + *
  *  7.42
  *  - Add HFFUSE_OVER_IO_URING and all other io-uring related flags and data
  *    structures:
@@ -433,7 +431,9 @@ struct hffuse_file_lock {
  * HFFUSE_NO_EXPORT_SUPPORT: explicitly disable export support
  * HFFUSE_HAS_RESEND: kernel supports resending pending requests, and the high bit
  *		    of the request ID indicates resend requests
- * HFFUSE_ALLOW_IDMAP: allow creation of idmapped mounts
+ * HFFUSE_SEPARATE_BACKGROUND: separate background queue for WRITE requests and
+ *			     the others
+ * HFFUSE_WRITE_ALIGNMENT: write request is aligned on max_write boundary
  * HFFUSE_OVER_IO_URING: Indicate that client supports io-uring
  */
 #define HFFUSE_ASYNC_READ		(1 << 0)
@@ -477,11 +477,13 @@ struct hffuse_file_lock {
 #define HFFUSE_PASSTHROUGH	(1ULL << 37)
 #define HFFUSE_NO_EXPORT_SUPPORT	(1ULL << 38)
 #define HFFUSE_HAS_RESEND		(1ULL << 39)
+#define HFFUSE_OVER_IO_URING	(1ULL << 41)
+#define HFFUSE_WRITE_ALIGNMENT	(1ULL << 55)
+#define HFFUSE_SEPARATE_BACKGROUND (1ULL << 56)
+/* The 57th bit is left to HFFUSE_HAS_RECOVERY */
 
 /* Obsolete alias for HFFUSE_DIRECT_IO_ALLOW_MMAP */
 #define HFFUSE_DIRECT_IO_RELAX	HFFUSE_DIRECT_IO_ALLOW_MMAP
-#define HFFUSE_ALLOW_IDMAP	(1ULL << 40)
-#define HFFUSE_OVER_IO_URING	(1ULL << 41)
 
 /**
  * CUSE INIT request/reply flags
@@ -1000,21 +1002,6 @@ struct hffuse_fallocate_in {
  */
 #define HFFUSE_UNIQUE_RESEND (1ULL << 63)
 
-/**
- * This value will be set by the kernel to
- * (struct hffuse_in_header).{uid,gid} fields in
- * case when:
- * - hffuse daemon enabled HFFUSE_ALLOW_IDMAP
- * - idmapping information is not available and uid/gid
- *   can not be mapped in accordance with an idmapping.
- *
- * Note: an idmapping information always available
- * for inode creation operations like:
- * HFFUSE_MKNOD, HFFUSE_SYMLINK, HFFUSE_MKDIR, HFFUSE_TMPFILE,
- * HFFUSE_CREATE and HFFUSE_RENAME2 (with RENAME_WHITEOUT).
- */
-#define HFFUSE_INVALID_UIDGID ((uint32_t)(-1))
-
 struct hffuse_in_header {
 	uint32_t	len;
 	uint32_t	opcode;
@@ -1279,7 +1266,5 @@ struct hffuse_uring_cmd_req {
 	uint16_t qid;
 	uint8_t padding[6];
 };
-
-#define HFFUSE_MINOR 251
 
 #endif /* _LINUX_HFFUSE_H */

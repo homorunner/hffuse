@@ -13,7 +13,7 @@ static struct ctl_table_header *hffuse_table_header;
 /* Bound by hffuse_init_out max_pages, which is a u16 */
 static unsigned int sysctl_hffuse_max_pages_limit = 65535;
 
-static const struct ctl_table hffuse_sysctl_table[] = {
+static struct ctl_table hffuse_sysctl_table[] = {
 	{
 		.procname	= "max_pages_limit",
 		.data		= &hffuse_max_pages_limit,

@@ -44,6 +44,30 @@ static ssize_t hffuse_conn_abort_write(struct file *file, const char __user *buf
 	return count;
 }
 
+static ssize_t hffuse_conn_flush_write(struct file *file, const char __user *buf,
+				     size_t count, loff_t *ppos)
+{
+	struct hffuse_conn *fc = hffuse_ctl_file_conn_get(file);
+
+	if (fc) {
+		hffuse_flush_pq(fc);
+		hffuse_conn_put(fc);
+	}
+	return count;
+}
+
+static ssize_t hffuse_conn_resend_write(struct file *file, const char __user *buf,
+				      size_t count, loff_t *ppos)
+{
+	struct hffuse_conn *fc = hffuse_ctl_file_conn_get(file);
+
+	if (fc) {
+		hffuse_resend(fc);
+		hffuse_conn_put(fc);
+	}
+	return count;
+}
+
 static ssize_t hffuse_conn_waiting_read(struct file *file, char __user *buf,
 				      size_t len, loff_t *ppos)
 {
@@ -183,23 +207,39 @@ out:
 static const struct file_operations hffuse_ctl_abort_ops = {
 	.open = nonseekable_open,
 	.write = hffuse_conn_abort_write,
+	.llseek = no_llseek,
+};
+
+static const struct file_operations hffuse_ctl_flush_ops = {
+	.open = nonseekable_open,
+	.write = hffuse_conn_flush_write,
+	.llseek = no_llseek,
+};
+
+static const struct file_operations hffuse_ctl_resend_ops = {
+	.open = nonseekable_open,
+	.write = hffuse_conn_resend_write,
+	.llseek = no_llseek,
 };
 
 static const struct file_operations hffuse_ctl_waiting_ops = {
 	.open = nonseekable_open,
 	.read = hffuse_conn_waiting_read,
+	.llseek = no_llseek,
 };
 
 static const struct file_operations hffuse_conn_max_background_ops = {
 	.open = nonseekable_open,
 	.read = hffuse_conn_max_background_read,
 	.write = hffuse_conn_max_background_write,
+	.llseek = no_llseek,
 };
 
 static const struct file_operations hffuse_conn_congestion_threshold_ops = {
 	.open = nonseekable_open,
 	.read = hffuse_conn_congestion_threshold_read,
 	.write = hffuse_conn_congestion_threshold_write,
+	.llseek = no_llseek,
 };
 
 static struct dentry *hffuse_ctl_add_dentry(struct dentry *parent,
@@ -227,7 +267,7 @@ static struct dentry *hffuse_ctl_add_dentry(struct dentry *parent,
 	inode->i_mode = mode;
 	inode->i_uid = fc->user_id;
 	inode->i_gid = fc->group_id;
-	simple_inode_init_ts(inode);
+	inode->i_atime = inode->i_mtime = inode_set_ctime_current(inode);
 	/* setting ->i_op to NULL is not allowed */
 	if (iop)
 		inode->i_op = iop;
@@ -266,6 +306,10 @@ int hffuse_ctl_add_conn(struct hffuse_conn *fc)
 				 NULL, &hffuse_ctl_waiting_ops) ||
 	    !hffuse_ctl_add_dentry(parent, fc, "abort", S_IFREG | 0200, 1,
 				 NULL, &hffuse_ctl_abort_ops) ||
+	    !hffuse_ctl_add_dentry(parent, fc, "flush", S_IFREG | 0200, 1,
+				 NULL, &hffuse_ctl_flush_ops) ||
+	    !hffuse_ctl_add_dentry(parent, fc, "resend", S_IFREG | 0200, 1,
+				 NULL, &hffuse_ctl_resend_ops) ||
 	    !hffuse_ctl_add_dentry(parent, fc, "max_background", S_IFREG | 0600,
 				 1, NULL, &hffuse_conn_max_background_ops) ||
 	    !hffuse_ctl_add_dentry(parent, fc, "congestion_threshold",

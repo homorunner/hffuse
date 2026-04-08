@@ -774,6 +774,16 @@ out:
 	return ret;
 }
 
+static int hffuse_dax_writepages(struct address_space *mapping,
+			       struct writeback_control *wbc)
+{
+
+	struct inode *inode = mapping->host;
+	struct hffuse_conn *fc = get_hffuse_conn(inode);
+
+	return dax_writeback_mapping_range(mapping, fc->dax->dev, wbc);
+}
+
 static vm_fault_t __hffuse_dax_fault(struct vm_fault *vmf, unsigned int order,
 		bool write)
 {
@@ -1313,6 +1323,7 @@ bool hffuse_dax_inode_alloc(struct super_block *sb, struct hffuse_inode *fi)
 }
 
 static const struct address_space_operations hffuse_dax_file_aops  = {
+	.writepages	= hffuse_dax_writepages,
 	.direct_IO	= noop_direct_IO,
 	.dirty_folio	= noop_dirty_folio,
 };

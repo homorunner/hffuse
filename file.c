@@ -19,8 +19,6 @@
 #include <linux/uio.h>
 #include <linux/fs.h>
 #include <linux/filelock.h>
-#include <linux/splice.h>
-#include <linux/task_io_accounting_ops.h>
 
 static int hffuse_send_open(struct hffuse_mount *fm, u64 nodeid,
 			  unsigned int open_flags, int opcode,
@@ -69,6 +67,7 @@ struct hffuse_file *hffuse_file_alloc(struct hffuse_mount *fm, bool release)
 	}
 
 	INIT_LIST_HEAD(&ff->write_entry);
+	mutex_init(&ff->readdir.lock);
 	refcount_set(&ff->count, 1);
 	RB_CLEAR_NODE(&ff->polled_node);
 	init_waitqueue_head(&ff->poll_wait);
@@ -81,6 +80,7 @@ struct hffuse_file *hffuse_file_alloc(struct hffuse_mount *fm, bool release)
 void hffuse_file_free(struct hffuse_file *ff)
 {
 	kfree(ff->args);
+	mutex_destroy(&ff->readdir.lock);
 	kfree(ff);
 }
 
@@ -436,7 +436,7 @@ static struct hffuse_writepage_args *hffuse_find_writeback(struct hffuse_inode *
 		wpa = rb_entry(n, struct hffuse_writepage_args, writepages_entry);
 		WARN_ON(get_hffuse_inode(wpa->inode) != fi);
 		curr_index = wpa->ia.write.in.offset >> PAGE_SHIFT;
-		if (idx_from >= curr_index + wpa->ia.ap.num_folios)
+		if (idx_from >= curr_index + wpa->ia.ap.num_pages)
 			n = n->rb_right;
 		else if (idx_to < curr_index)
 			n = n->rb_left;
@@ -481,21 +481,6 @@ static void hffuse_wait_on_page_writeback(struct inode *inode, pgoff_t index)
 	struct hffuse_inode *fi = get_hffuse_inode(inode);
 
 	wait_event(fi->page_waitq, !hffuse_page_is_writeback(inode, index));
-}
-
-static inline bool hffuse_folio_is_writeback(struct inode *inode,
-					   struct folio *folio)
-{
-	pgoff_t last = folio_next_index(folio) - 1;
-	return hffuse_range_is_writeback(inode, folio_index(folio), last);
-}
-
-static void hffuse_wait_on_folio_writeback(struct inode *inode,
-					 struct folio *folio)
-{
-	struct hffuse_inode *fi = get_hffuse_inode(inode);
-
-	wait_event(fi->page_waitq, !hffuse_folio_is_writeback(inode, folio));
 }
 
 /*
@@ -665,11 +650,10 @@ static void hffuse_release_user_pages(struct hffuse_args_pages *ap, ssize_t nres
 {
 	unsigned int i;
 
-	for (i = 0; i < ap->num_folios; i++) {
+	for (i = 0; i < ap->num_pages; i++) {
 		if (should_dirty)
-			folio_mark_dirty_lock(ap->folios[i]);
-		if (ap->args.is_pinned)
-			unpin_folio(ap->folios[i]);
+			set_page_dirty_lock(ap->pages[i]);
+		put_page(ap->pages[i]);
 	}
 
 	if (nres > 0 && ap->args.invalidate_vmap)
@@ -743,16 +727,16 @@ static void hffuse_aio_complete(struct hffuse_io_priv *io, int err, ssize_t pos)
 }
 
 static struct hffuse_io_args *hffuse_io_alloc(struct hffuse_io_priv *io,
-						 unsigned int nfolios)
+					  unsigned int npages)
 {
 	struct hffuse_io_args *ia;
 
 	ia = kzalloc(sizeof(*ia), GFP_KERNEL);
 	if (ia) {
 		ia->io = io;
-		ia->ap.folios = hffuse_folios_alloc(nfolios, GFP_KERNEL,
-						  &ia->ap.descs);
-		if (!ia->ap.folios) {
+		ia->ap.pages = hffuse_pages_alloc(npages, GFP_KERNEL,
+						&ia->ap.descs);
+		if (!ia->ap.pages) {
 			kfree(ia);
 			ia = NULL;
 		}
@@ -762,7 +746,7 @@ static struct hffuse_io_args *hffuse_io_alloc(struct hffuse_io_priv *io,
 
 static void hffuse_io_free(struct hffuse_io_args *ia)
 {
-	kfree(ia->ap.folios);
+	kfree(ia->ap.pages);
 	kfree(ia);
 }
 
@@ -865,33 +849,33 @@ static void hffuse_short_read(struct inode *inode, u64 attr_ver, size_t num_read
 	 * reached the client fs yet.  So the hole is not present there.
 	 */
 	if (!fc->writeback_cache) {
-		loff_t pos = folio_pos(ap->folios[0]) + num_read;
+		loff_t pos = page_offset(ap->pages[0]) + num_read;
 		hffuse_read_update_size(inode, pos, attr_ver);
 	}
 }
 
-static int hffuse_do_readfolio(struct file *file, struct folio *folio)
+static int hffuse_do_readpage(struct file *file, struct page *page)
 {
-	struct inode *inode = folio->mapping->host;
+	struct inode *inode = page->mapping->host;
 	struct hffuse_mount *fm = get_hffuse_mount(inode);
-	loff_t pos = folio_pos(folio);
-	struct hffuse_folio_desc desc = { .length = PAGE_SIZE };
+	loff_t pos = page_offset(page);
+	struct hffuse_page_desc desc = { .length = PAGE_SIZE };
 	struct hffuse_io_args ia = {
 		.ap.args.page_zeroing = true,
 		.ap.args.out_pages = true,
-		.ap.num_folios = 1,
-		.ap.folios = &folio,
+		.ap.num_pages = 1,
+		.ap.pages = &page,
 		.ap.descs = &desc,
 	};
 	ssize_t res;
 	u64 attr_ver;
 
 	/*
-	 * With the temporary pages that are used to complete writeback, we can
-	 * have writeback that extends beyond the lifetime of the folio.  So
-	 * make sure we read a properly synced folio.
+	 * Page writeback can extend beyond the lifetime of the
+	 * page-cache page, so make sure we read a properly synced
+	 * page.
 	 */
-	hffuse_wait_on_folio_writeback(inode, folio);
+	hffuse_wait_on_page_writeback(inode, page->index);
 
 	attr_ver = hffuse_get_attr_version(fm->fc);
 
@@ -909,24 +893,25 @@ static int hffuse_do_readfolio(struct file *file, struct folio *folio)
 	if (res < desc.length)
 		hffuse_short_read(inode, attr_ver, res, &ia.ap);
 
-	folio_mark_uptodate(folio);
+	SetPageUptodate(page);
 
 	return 0;
 }
 
 static int hffuse_read_folio(struct file *file, struct folio *folio)
 {
-	struct inode *inode = folio->mapping->host;
+	struct page *page = &folio->page;
+	struct inode *inode = page->mapping->host;
 	int err;
 
 	err = -EIO;
 	if (hffuse_is_bad(inode))
 		goto out;
 
-	err = hffuse_do_readfolio(file, folio);
+	err = hffuse_do_readpage(file, page);
 	hffuse_invalidate_atime(inode);
  out:
-	folio_unlock(folio);
+	unlock_page(page);
 	return err;
 }
 
@@ -940,8 +925,8 @@ static void hffuse_readpages_end(struct hffuse_mount *fm, struct hffuse_args *ar
 	size_t num_read = args->out_args[0].size;
 	struct address_space *mapping = NULL;
 
-	for (i = 0; mapping == NULL && i < ap->num_folios; i++)
-		mapping = ap->folios[i]->mapping;
+	for (i = 0; mapping == NULL && i < ap->num_pages; i++)
+		mapping = ap->pages[i]->mapping;
 
 	if (mapping) {
 		struct inode *inode = mapping->host;
@@ -955,9 +940,15 @@ static void hffuse_readpages_end(struct hffuse_mount *fm, struct hffuse_args *ar
 		hffuse_invalidate_atime(inode);
 	}
 
-	for (i = 0; i < ap->num_folios; i++) {
-		folio_end_read(ap->folios[i], !err);
-		folio_put(ap->folios[i]);
+	for (i = 0; i < ap->num_pages; i++) {
+		struct page *page = ap->pages[i];
+
+		if (!err)
+			SetPageUptodate(page);
+		else
+			SetPageError(page);
+		unlock_page(page);
+		put_page(page);
 	}
 	if (ia->ff)
 		hffuse_file_put(ia->ff, false);
@@ -970,9 +961,8 @@ static void hffuse_send_readpages(struct hffuse_io_args *ia, struct file *file)
 	struct hffuse_file *ff = file->private_data;
 	struct hffuse_mount *fm = ff->fm;
 	struct hffuse_args_pages *ap = &ia->ap;
-	loff_t pos = folio_pos(ap->folios[0]);
-	/* Currently, all folios in HFFUSE are one page */
-	size_t count = ap->num_folios << PAGE_SHIFT;
+	loff_t pos = page_offset(ap->pages[0]);
+	size_t count = ap->num_pages << PAGE_SHIFT;
 	ssize_t res;
 	int err;
 
@@ -983,7 +973,7 @@ static void hffuse_send_readpages(struct hffuse_io_args *ia, struct file *file)
 	/* Don't overflow end offset */
 	if (pos + (count - 1) == LLONG_MAX) {
 		count--;
-		ap->descs[ap->num_folios - 1].length--;
+		ap->descs[ap->num_pages - 1].length--;
 	}
 	WARN_ON((loff_t) (pos + count) < 0);
 
@@ -992,6 +982,11 @@ static void hffuse_send_readpages(struct hffuse_io_args *ia, struct file *file)
 	if (fm->fc->async_read) {
 		ia->ff = hffuse_file_get(ff);
 		ap->args.end = hffuse_readpages_end;
+		/* force background request to avoid starvation from writeback */
+		if (fm->fc->separate_background) {
+			ap->args.force = true;
+			ap->args.nocreds = true;
+		}
 		err = hffuse_simple_background(fm, &ap->args, GFP_KERNEL);
 		if (!err)
 			return;
@@ -1007,7 +1002,7 @@ static void hffuse_readahead(struct readahead_control *rac)
 	struct inode *inode = rac->mapping->host;
 	struct hffuse_inode *fi = get_hffuse_inode(inode);
 	struct hffuse_conn *fc = get_hffuse_conn(inode);
-	unsigned int max_pages, nr_pages;
+	unsigned int i, max_pages, nr_pages = 0;
 	pgoff_t first = readahead_index(rac);
 	pgoff_t last = first + readahead_count(rac) - 1;
 
@@ -1019,22 +1014,9 @@ static void hffuse_readahead(struct readahead_control *rac)
 	max_pages = min_t(unsigned int, fc->max_pages,
 			fc->max_read / PAGE_SIZE);
 
-	/*
-	 * This is only accurate the first time through, since readahead_folio()
-	 * doesn't update readahead_count() from the previous folio until the
-	 * next call.  Grab nr_pages here so we know how many pages we're going
-	 * to have to process.  This means that we will exit here with
-	 * readahead_count() == folio_nr_pages(last_folio), but we will have
-	 * consumed all of the folios, and read_pages() will call
-	 * readahead_folio() again which will clean up the rac.
-	 */
-	nr_pages = readahead_count(rac);
-
-	while (nr_pages) {
+	for (;;) {
 		struct hffuse_io_args *ia;
 		struct hffuse_args_pages *ap;
-		struct folio *folio;
-		unsigned cur_pages = min(max_pages, nr_pages);
 
 		if (fc->num_background >= fc->congestion_threshold &&
 		    rac->ra->async_size >= readahead_count(rac))
@@ -1044,26 +1026,21 @@ static void hffuse_readahead(struct readahead_control *rac)
 			 */
 			break;
 
-		ia = hffuse_io_alloc(NULL, cur_pages);
+		nr_pages = readahead_count(rac) - nr_pages;
+		if (nr_pages > max_pages)
+			nr_pages = max_pages;
+		if (nr_pages == 0)
+			break;
+		ia = hffuse_io_alloc(NULL, nr_pages);
 		if (!ia)
 			return;
 		ap = &ia->ap;
-
-		while (ap->num_folios < cur_pages) {
-			/*
-			 * This returns a folio with a ref held on it.
-			 * The ref needs to be held until the request is
-			 * completed, since the splice case (see
-			 * hffuse_try_move_page()) drops the ref after it's
-			 * replaced in the page cache.
-			 */
-			folio = __readahead_folio(rac);
-			ap->folios[ap->num_folios] = folio;
-			ap->descs[ap->num_folios].length = folio_size(folio);
-			ap->num_folios++;
+		nr_pages = __readahead_batch(rac, ap->pages, nr_pages);
+		for (i = 0; i < nr_pages; i++) {
+			ap->descs[i].length = PAGE_SIZE;
 		}
+		ap->num_pages = nr_pages;
 		hffuse_send_readpages(ia, rac->file);
-		nr_pages -= cur_pages;
 	}
 }
 
@@ -1180,8 +1157,8 @@ static ssize_t hffuse_send_write_pages(struct hffuse_io_args *ia,
 	bool short_write;
 	int err;
 
-	for (i = 0; i < ap->num_folios; i++)
-		hffuse_wait_on_folio_writeback(inode, ap->folios[i]);
+	for (i = 0; i < ap->num_pages; i++)
+		hffuse_wait_on_page_writeback(inode, ap->pages[i]->index);
 
 	hffuse_write_args_fill(ia, ff, pos, count);
 	ia->write.in.flags = hffuse_write_flags(iocb);
@@ -1195,24 +1172,24 @@ static ssize_t hffuse_send_write_pages(struct hffuse_io_args *ia,
 	short_write = ia->write.out.size < count;
 	offset = ap->descs[0].offset;
 	count = ia->write.out.size;
-	for (i = 0; i < ap->num_folios; i++) {
-		struct folio *folio = ap->folios[i];
+	for (i = 0; i < ap->num_pages; i++) {
+		struct page *page = ap->pages[i];
 
 		if (err) {
-			folio_clear_uptodate(folio);
+			ClearPageUptodate(page);
 		} else {
-			if (count >= folio_size(folio) - offset)
-				count -= folio_size(folio) - offset;
+			if (count >= PAGE_SIZE - offset)
+				count -= PAGE_SIZE - offset;
 			else {
 				if (short_write)
-					folio_clear_uptodate(folio);
+					ClearPageUptodate(page);
 				count = 0;
 			}
 			offset = 0;
 		}
-		if (ia->write.folio_locked && (i == ap->num_folios - 1))
-			folio_unlock(folio);
-		folio_put(folio);
+		if (ia->write.page_locked && (i == ap->num_pages - 1))
+			unlock_page(page);
+		put_page(page);
 	}
 
 	return err;
@@ -1226,7 +1203,6 @@ static ssize_t hffuse_fill_write_pages(struct hffuse_io_args *ia,
 	struct hffuse_args_pages *ap = &ia->ap;
 	struct hffuse_conn *fc = get_hffuse_conn(mapping->host);
 	unsigned offset = pos & (PAGE_SIZE - 1);
-	unsigned int nr_pages = 0;
 	size_t count = 0;
 	int err;
 
@@ -1235,7 +1211,7 @@ static ssize_t hffuse_fill_write_pages(struct hffuse_io_args *ia,
 
 	do {
 		size_t tmp;
-		struct folio *folio;
+		struct page *page;
 		pgoff_t index = pos >> PAGE_SHIFT;
 		size_t bytes = min_t(size_t, PAGE_SIZE - offset,
 				     iov_iter_count(ii));
@@ -1247,30 +1223,27 @@ static ssize_t hffuse_fill_write_pages(struct hffuse_io_args *ia,
 		if (fault_in_iov_iter_readable(ii, bytes))
 			break;
 
-		folio = __filemap_get_folio(mapping, index, FGP_WRITEBEGIN,
-					    mapping_gfp_mask(mapping));
-		if (IS_ERR(folio)) {
-			err = PTR_ERR(folio);
+		err = -ENOMEM;
+		page = grab_cache_page_write_begin(mapping, index);
+		if (!page)
 			break;
-		}
 
 		if (mapping_writably_mapped(mapping))
-			flush_dcache_folio(folio);
+			flush_dcache_page(page);
 
-		tmp = copy_folio_from_iter_atomic(folio, offset, bytes, ii);
-		flush_dcache_folio(folio);
+		tmp = copy_page_from_iter_atomic(page, offset, bytes, ii);
+		flush_dcache_page(page);
 
 		if (!tmp) {
-			folio_unlock(folio);
-			folio_put(folio);
+			unlock_page(page);
+			put_page(page);
 			goto again;
 		}
 
 		err = 0;
-		ap->folios[ap->num_folios] = folio;
-		ap->descs[ap->num_folios].length = tmp;
-		ap->num_folios++;
-		nr_pages++;
+		ap->pages[ap->num_pages] = page;
+		ap->descs[ap->num_pages].length = tmp;
+		ap->num_pages++;
 
 		count += tmp;
 		pos += tmp;
@@ -1280,18 +1253,18 @@ static ssize_t hffuse_fill_write_pages(struct hffuse_io_args *ia,
 
 		/* If we copied full page, mark it uptodate */
 		if (tmp == PAGE_SIZE)
-			folio_mark_uptodate(folio);
+			SetPageUptodate(page);
 
-		if (folio_test_uptodate(folio)) {
-			folio_unlock(folio);
+		if (PageUptodate(page)) {
+			unlock_page(page);
 		} else {
-			ia->write.folio_locked = true;
+			ia->write.page_locked = true;
 			break;
 		}
 		if (!fc->big_writes)
 			break;
 	} while (iov_iter_count(ii) && count < fc->max_write &&
-		 nr_pages < max_pages && offset == 0);
+		 ap->num_pages < max_pages && offset == 0);
 
 	return count > 0 ? count : err;
 }
@@ -1325,8 +1298,8 @@ static ssize_t hffuse_perform_write(struct kiocb *iocb, struct iov_iter *ii)
 		unsigned int nr_pages = hffuse_wr_pages(pos, iov_iter_count(ii),
 						      fc->max_pages);
 
-		ap->folios = hffuse_folios_alloc(nr_pages, GFP_KERNEL, &ap->descs);
-		if (!ap->folios) {
+		ap->pages = hffuse_pages_alloc(nr_pages, GFP_KERNEL, &ap->descs);
+		if (!ap->pages) {
 			err = -ENOMEM;
 			break;
 		}
@@ -1348,7 +1321,7 @@ static ssize_t hffuse_perform_write(struct kiocb *iocb, struct iov_iter *ii)
 					err = -EIO;
 			}
 		}
-		kfree(ap->folios);
+		kfree(ap->pages);
 	} while (!err && iov_iter_count(ii));
 
 	hffuse_write_update_attr(inode, pos, res);
@@ -1443,11 +1416,10 @@ static void hffuse_dio_unlock(struct kiocb *iocb, bool exclusive)
 static ssize_t hffuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
 	struct file *file = iocb->ki_filp;
-	struct mnt_idmap *idmap = file_mnt_idmap(file);
 	struct address_space *mapping = file->f_mapping;
 	ssize_t written = 0;
 	struct inode *inode = mapping->host;
-	ssize_t err, count;
+	ssize_t err;
 	struct hffuse_conn *fc = get_hffuse_conn(inode);
 
 	if (fc->writeback_cache) {
@@ -1458,7 +1430,7 @@ static ssize_t hffuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from
 			return err;
 
 		if (fc->handle_killpriv_v2 &&
-		    setattr_should_drop_suidgid(idmap,
+		    setattr_should_drop_suidgid(&nop_mnt_idmap,
 						file_inode(file))) {
 			goto writethrough;
 		}
@@ -1469,13 +1441,15 @@ static ssize_t hffuse_cache_write_iter(struct kiocb *iocb, struct iov_iter *from
 writethrough:
 	inode_lock(inode);
 
-	err = count = generic_write_checks(iocb, from);
+	err = generic_write_checks(iocb, from);
 	if (err <= 0)
 		goto out;
 
-	task_io_account_write(count);
+	err = file_remove_privs(file);
+	if (err)
+		goto out;
 
-	err = kiocb_modified(iocb);
+	err = file_update_time(file);
 	if (err)
 		goto out;
 
@@ -1513,7 +1487,6 @@ static int hffuse_get_user_pages(struct hffuse_args_pages *ap, struct iov_iter *
 			       bool use_pages_for_kvec_io)
 {
 	bool flush_or_invalidate = false;
-	unsigned int nr_pages = 0;
 	size_t nbytes = 0;  /* # bytes already packed in req */
 	ssize_t ret = 0;
 
@@ -1543,63 +1516,39 @@ static int hffuse_get_user_pages(struct hffuse_args_pages *ap, struct iov_iter *
 		}
 	}
 
-	/*
-	 * Until there is support for iov_iter_extract_folios(), we have to
-	 * manually extract pages using iov_iter_extract_pages() and then
-	 * copy that to a folios array.
-	 */
-	struct page **pages = kzalloc(max_pages * sizeof(struct page *),
-				      GFP_KERNEL);
-	if (!pages) {
-		ret = -ENOMEM;
-		goto out;
-	}
-
-	while (nbytes < *nbytesp && nr_pages < max_pages) {
-		unsigned nfolios, i;
+	while (nbytes < *nbytesp && ap->num_pages < max_pages) {
+		unsigned npages;
 		size_t start;
-
-		ret = iov_iter_extract_pages(ii, &pages,
-					     *nbytesp - nbytes,
-					     max_pages - nr_pages,
-					     0, &start);
+		ret = iov_iter_get_pages2(ii, &ap->pages[ap->num_pages],
+					*nbytesp - nbytes,
+					max_pages - ap->num_pages,
+					&start);
 		if (ret < 0)
 			break;
 
 		nbytes += ret;
 
-		nfolios = DIV_ROUND_UP(ret + start, PAGE_SIZE);
+		ret += start;
+		npages = DIV_ROUND_UP(ret, PAGE_SIZE);
 
-		for (i = 0; i < nfolios; i++) {
-			struct folio *folio = page_folio(pages[i]);
-			unsigned int offset = start +
-				(folio_page_idx(folio, pages[i]) << PAGE_SHIFT);
-			unsigned int len = min_t(unsigned int, ret, PAGE_SIZE - start);
+		ap->descs[ap->num_pages].offset = start;
+		hffuse_page_descs_length_init(ap->descs, ap->num_pages, npages);
 
-			ap->descs[ap->num_folios].offset = offset;
-			ap->descs[ap->num_folios].length = len;
-			ap->folios[ap->num_folios] = folio;
-			start = 0;
-			ret -= len;
-			ap->num_folios++;
-		}
-
-		nr_pages += nfolios;
+		ap->num_pages += npages;
+		ap->descs[ap->num_pages - 1].length -=
+			(PAGE_SIZE - ret) & (PAGE_SIZE - 1);
 	}
-	kfree(pages);
 
 	if (write && flush_or_invalidate)
 		flush_kernel_vmap_range(ap->args.vmap_base, nbytes);
 
 	ap->args.invalidate_vmap = !write && flush_or_invalidate;
-	ap->args.is_pinned = iov_iter_extract_will_pin(ii);
 	ap->args.user_pages = true;
 	if (write)
 		ap->args.in_pages = true;
 	else
 		ap->args.out_pages = true;
 
-out:
 	*nbytesp = nbytes;
 
 	return ret < 0 ? ret : 0;
@@ -1729,7 +1678,7 @@ static ssize_t hffuse_direct_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
 	ssize_t res;
 
-	if (!is_sync_kiocb(iocb)) {
+	if (!is_sync_kiocb(iocb) && iocb->ki_flags & IOCB_DIRECT) {
 		res = hffuse_direct_IO(iocb, to);
 	} else {
 		struct hffuse_io_priv io = HFFUSE_IO_PRIV_SYNC(iocb);
@@ -1743,18 +1692,16 @@ static ssize_t hffuse_direct_read_iter(struct kiocb *iocb, struct iov_iter *to)
 static ssize_t hffuse_direct_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
 	struct inode *inode = file_inode(iocb->ki_filp);
+	struct hffuse_io_priv io = HFFUSE_IO_PRIV_SYNC(iocb);
 	ssize_t res;
 	bool exclusive;
 
 	hffuse_dio_lock(iocb, from, &exclusive);
 	res = generic_write_checks(iocb, from);
 	if (res > 0) {
-		task_io_account_write(res);
-		if (!is_sync_kiocb(iocb)) {
+		if (!is_sync_kiocb(iocb) && iocb->ki_flags & IOCB_DIRECT) {
 			res = hffuse_direct_IO(iocb, from);
 		} else {
-			struct hffuse_io_priv io = HFFUSE_IO_PRIV_SYNC(iocb);
-
 			res = hffuse_direct_io(&io, from, &iocb->ki_pos,
 					     HFFUSE_DIO_WRITE);
 			hffuse_write_update_attr(inode, iocb->ki_pos, res);
@@ -1840,34 +1787,30 @@ static void hffuse_writepage_free(struct hffuse_writepage_args *wpa)
 	if (wpa->bucket)
 		hffuse_sync_bucket_dec(wpa->bucket);
 
-	for (i = 0; i < ap->num_folios; i++)
-		folio_put(ap->folios[i]);
+	for (i = 0; i < ap->num_pages; i++)
+		__free_page(ap->pages[i]);
 
-	hffuse_file_put(wpa->ia.ff, false);
+	if (wpa->ia.ff)
+		hffuse_file_put(wpa->ia.ff, false);
 
-	kfree(ap->folios);
+	kfree(ap->pages);
 	kfree(wpa);
 }
 
-static void hffuse_writepage_finish_stat(struct inode *inode, struct folio *folio)
-{
-	struct backing_dev_info *bdi = inode_to_bdi(inode);
-
-	dec_wb_stat(&bdi->wb, WB_WRITEBACK);
-	node_stat_sub_folio(folio, NR_WRITEBACK_TEMP);
-	wb_writeout_inc(&bdi->wb);
-}
-
-static void hffuse_writepage_finish(struct hffuse_writepage_args *wpa)
+static void hffuse_writepage_finish(struct hffuse_mount *fm,
+				  struct hffuse_writepage_args *wpa)
 {
 	struct hffuse_args_pages *ap = &wpa->ia.ap;
 	struct inode *inode = wpa->inode;
 	struct hffuse_inode *fi = get_hffuse_inode(inode);
+	struct backing_dev_info *bdi = inode_to_bdi(inode);
 	int i;
 
-	for (i = 0; i < ap->num_folios; i++)
-		hffuse_writepage_finish_stat(inode, ap->folios[i]);
-
+	for (i = 0; i < ap->num_pages; i++) {
+		dec_wb_stat(&bdi->wb, WB_WRITEBACK);
+		dec_node_page_state(ap->pages[i], NR_WRITEBACK_TEMP);
+		wb_writeout_inc(&bdi->wb);
+	}
 	wake_up(&fi->page_waitq);
 }
 
@@ -1881,8 +1824,7 @@ __acquires(fi->lock)
 	struct hffuse_inode *fi = get_hffuse_inode(wpa->inode);
 	struct hffuse_write_in *inarg = &wpa->ia.write.in;
 	struct hffuse_args *args = &wpa->ia.ap.args;
-	/* Currently, all folios in HFFUSE are one page */
-	__u64 data_size = wpa->ia.ap.num_folios * PAGE_SIZE;
+	__u64 data_size = wpa->ia.ap.num_pages * PAGE_SIZE;
 	int err;
 
 	fi->writectr++;
@@ -1915,15 +1857,19 @@ __acquires(fi->lock)
  out_free:
 	fi->writectr--;
 	rb_erase(&wpa->writepages_entry, &fi->writepages);
-	hffuse_writepage_finish(wpa);
+	hffuse_writepage_finish(fm, wpa);
 	spin_unlock(&fi->lock);
 
 	/* After rb_erase() aux request list is private */
 	for (aux = wpa->next; aux; aux = next) {
+		struct backing_dev_info *bdi = inode_to_bdi(aux->inode);
+
 		next = aux->next;
 		aux->next = NULL;
-		hffuse_writepage_finish_stat(aux->inode,
-					   aux->ia.ap.folios[0]);
+
+		dec_wb_stat(&bdi->wb, WB_WRITEBACK);
+		dec_node_page_state(aux->ia.ap.pages[0], NR_WRITEBACK_TEMP);
+		wb_writeout_inc(&bdi->wb);
 		hffuse_writepage_free(aux);
 	}
 
@@ -1958,11 +1904,11 @@ static struct hffuse_writepage_args *hffuse_insert_writeback(struct rb_root *roo
 						struct hffuse_writepage_args *wpa)
 {
 	pgoff_t idx_from = wpa->ia.write.in.offset >> PAGE_SHIFT;
-	pgoff_t idx_to = idx_from + wpa->ia.ap.num_folios - 1;
+	pgoff_t idx_to = idx_from + wpa->ia.ap.num_pages - 1;
 	struct rb_node **p = &root->rb_node;
 	struct rb_node  *parent = NULL;
 
-	WARN_ON(!wpa->ia.ap.num_folios);
+	WARN_ON(!wpa->ia.ap.num_pages);
 	while (*p) {
 		struct hffuse_writepage_args *curr;
 		pgoff_t curr_index;
@@ -1973,7 +1919,7 @@ static struct hffuse_writepage_args *hffuse_insert_writeback(struct rb_root *roo
 		WARN_ON(curr->inode != wpa->inode);
 		curr_index = curr->ia.write.in.offset >> PAGE_SHIFT;
 
-		if (idx_from >= curr_index + curr->ia.ap.num_folios)
+		if (idx_from >= curr_index + curr->ia.ap.num_pages)
 			p = &(*p)->rb_right;
 		else if (idx_to < curr_index)
 			p = &(*p)->rb_left;
@@ -2018,6 +1964,7 @@ static void hffuse_writepage_end(struct hffuse_mount *fm, struct hffuse_args *ar
 
 		wpa->next = next->next;
 		next->next = NULL;
+		next->ia.ff = hffuse_file_get(wpa->ia.ff);
 		tree_insert(&fi->writepages, next);
 
 		/*
@@ -2046,7 +1993,7 @@ static void hffuse_writepage_end(struct hffuse_mount *fm, struct hffuse_args *ar
 		hffuse_send_writepage(fm, next, inarg->offset + inarg->size);
 	}
 	fi->writectr--;
-	hffuse_writepage_finish(wpa);
+	hffuse_writepage_finish(fm, wpa);
 	spin_unlock(&fi->lock);
 	hffuse_writepage_free(wpa);
 }
@@ -2105,9 +2052,9 @@ static struct hffuse_writepage_args *hffuse_writepage_args_alloc(void)
 	wpa = kzalloc(sizeof(*wpa), GFP_NOFS);
 	if (wpa) {
 		ap = &wpa->ia.ap;
-		ap->num_folios = 0;
-		ap->folios = hffuse_folios_alloc(1, GFP_NOFS, &ap->descs);
-		if (!ap->folios) {
+		ap->num_pages = 0;
+		ap->pages = hffuse_pages_alloc(1, GFP_NOFS, &ap->descs);
+		if (!ap->pages) {
 			kfree(wpa);
 			wpa = NULL;
 		}
@@ -2130,77 +2077,49 @@ static void hffuse_writepage_add_to_bucket(struct hffuse_conn *fc,
 	rcu_read_unlock();
 }
 
-static void hffuse_writepage_args_page_fill(struct hffuse_writepage_args *wpa, struct folio *folio,
-					  struct folio *tmp_folio, uint32_t folio_index)
+static int hffuse_writepage_locked(struct page *page)
 {
-	struct inode *inode = folio->mapping->host;
-	struct hffuse_args_pages *ap = &wpa->ia.ap;
-
-	folio_copy(tmp_folio, folio);
-
-	ap->folios[folio_index] = tmp_folio;
-	ap->descs[folio_index].offset = 0;
-	ap->descs[folio_index].length = PAGE_SIZE;
-
-	inc_wb_stat(&inode_to_bdi(inode)->wb, WB_WRITEBACK);
-	node_stat_add_folio(tmp_folio, NR_WRITEBACK_TEMP);
-}
-
-static struct hffuse_writepage_args *hffuse_writepage_args_setup(struct folio *folio,
-							     struct hffuse_file *ff)
-{
-	struct inode *inode = folio->mapping->host;
-	struct hffuse_conn *fc = get_hffuse_conn(inode);
-	struct hffuse_writepage_args *wpa;
-	struct hffuse_args_pages *ap;
-
-	wpa = hffuse_writepage_args_alloc();
-	if (!wpa)
-		return NULL;
-
-	hffuse_writepage_add_to_bucket(fc, wpa);
-	hffuse_write_args_fill(&wpa->ia, ff, folio_pos(folio), 0);
-	wpa->ia.write.in.write_flags |= HFFUSE_WRITE_CACHE;
-	wpa->inode = inode;
-	wpa->ia.ff = ff;
-
-	ap = &wpa->ia.ap;
-	ap->args.in_pages = true;
-	ap->args.end = hffuse_writepage_end;
-
-	return wpa;
-}
-
-static int hffuse_writepage_locked(struct folio *folio)
-{
-	struct address_space *mapping = folio->mapping;
+	struct address_space *mapping = page->mapping;
 	struct inode *inode = mapping->host;
+	struct hffuse_conn *fc = get_hffuse_conn(inode);
 	struct hffuse_inode *fi = get_hffuse_inode(inode);
 	struct hffuse_writepage_args *wpa;
 	struct hffuse_args_pages *ap;
-	struct folio *tmp_folio;
-	struct hffuse_file *ff;
+	struct page *tmp_page;
 	int error = -ENOMEM;
 
-	tmp_folio = folio_alloc(GFP_NOFS | __GFP_HIGHMEM, 0);
-	if (!tmp_folio)
+	set_page_writeback(page);
+
+	wpa = hffuse_writepage_args_alloc();
+	if (!wpa)
 		goto err;
+	ap = &wpa->ia.ap;
+
+	tmp_page = alloc_page(GFP_NOFS | __GFP_HIGHMEM);
+	if (!tmp_page)
+		goto err_free;
 
 	error = -EIO;
-	ff = hffuse_write_file_get(fi);
-	if (!ff)
+	wpa->ia.ff = hffuse_write_file_get(fi);
+	if (!wpa->ia.ff)
 		goto err_nofile;
 
-	wpa = hffuse_writepage_args_setup(folio, ff);
-	error = -ENOMEM;
-	if (!wpa)
-		goto err_writepage_args;
+	hffuse_writepage_add_to_bucket(fc, wpa);
+	hffuse_write_args_fill(&wpa->ia, wpa->ia.ff, page_offset(page), 0);
 
-	ap = &wpa->ia.ap;
-	ap->num_folios = 1;
+	copy_highpage(tmp_page, page);
+	wpa->ia.write.in.write_flags |= HFFUSE_WRITE_CACHE;
+	wpa->next = NULL;
+	ap->args.in_pages = true;
+	ap->num_pages = 1;
+	ap->pages[0] = tmp_page;
+	ap->descs[0].offset = 0;
+	ap->descs[0].length = PAGE_SIZE;
+	ap->args.end = hffuse_writepage_end;
+	wpa->inode = inode;
 
-	folio_start_writeback(folio);
-	hffuse_writepage_args_page_fill(wpa, folio, tmp_folio, 0);
+	inc_wb_stat(&inode_to_bdi(inode)->wb, WB_WRITEBACK);
+	inc_node_page_state(tmp_page, NR_WRITEBACK_TEMP);
 
 	spin_lock(&fi->lock);
 	tree_insert(&fi->writepages, wpa);
@@ -2208,49 +2127,78 @@ static int hffuse_writepage_locked(struct folio *folio)
 	hffuse_flush_writepages(inode);
 	spin_unlock(&fi->lock);
 
-	folio_end_writeback(folio);
+	end_page_writeback(page);
 
 	return 0;
 
-err_writepage_args:
-	hffuse_file_put(ff, false);
 err_nofile:
-	folio_put(tmp_folio);
+	__free_page(tmp_page);
+err_free:
+	kfree(wpa);
 err:
-	mapping_set_error(folio->mapping, error);
+	mapping_set_error(page->mapping, error);
+	end_page_writeback(page);
 	return error;
+}
+
+static int hffuse_writepage(struct page *page, struct writeback_control *wbc)
+{
+	struct hffuse_conn *fc = get_hffuse_conn(page->mapping->host);
+	int err;
+
+	if (hffuse_page_is_writeback(page->mapping->host, page->index)) {
+		/*
+		 * ->writepages() should be called for sync() and friends.  We
+		 * should only get here on direct reclaim and then we are
+		 * allowed to skip a page which is already in flight
+		 */
+		WARN_ON(wbc->sync_mode == WB_SYNC_ALL);
+
+		redirty_page_for_writepage(wbc, page);
+		unlock_page(page);
+		return 0;
+	}
+
+	if (wbc->sync_mode == WB_SYNC_NONE &&
+	    fc->num_background >= fc->congestion_threshold)
+		return AOP_WRITEPAGE_ACTIVATE;
+
+	err = hffuse_writepage_locked(page);
+	unlock_page(page);
+
+	return err;
 }
 
 struct hffuse_fill_wb_data {
 	struct hffuse_writepage_args *wpa;
 	struct hffuse_file *ff;
 	struct inode *inode;
-	struct folio **orig_folios;
-	unsigned int max_folios;
+	struct page **orig_pages;
+	unsigned int max_pages;
 };
 
 static bool hffuse_pages_realloc(struct hffuse_fill_wb_data *data)
 {
 	struct hffuse_args_pages *ap = &data->wpa->ia.ap;
 	struct hffuse_conn *fc = get_hffuse_conn(data->inode);
-	struct folio **folios;
-	struct hffuse_folio_desc *descs;
-	unsigned int nfolios = min_t(unsigned int,
-				     max_t(unsigned int, data->max_folios * 2,
-					   HFFUSE_DEFAULT_MAX_PAGES_PER_REQ),
+	struct page **pages;
+	struct hffuse_page_desc *descs;
+	unsigned int npages = min_t(unsigned int,
+				    max_t(unsigned int, data->max_pages * 2,
+					  HFFUSE_DEFAULT_MAX_PAGES_PER_REQ),
 				    fc->max_pages);
-	WARN_ON(nfolios <= data->max_folios);
+	WARN_ON(npages <= data->max_pages);
 
-	folios = hffuse_folios_alloc(nfolios, GFP_NOFS, &descs);
-	if (!folios)
+	pages = hffuse_pages_alloc(npages, GFP_NOFS, &descs);
+	if (!pages)
 		return false;
 
-	memcpy(folios, ap->folios, sizeof(struct folio *) * ap->num_folios);
-	memcpy(descs, ap->descs, sizeof(struct hffuse_folio_desc) * ap->num_folios);
-	kfree(ap->folios);
-	ap->folios = folios;
+	memcpy(pages, ap->pages, sizeof(struct page *) * ap->num_pages);
+	memcpy(descs, ap->descs, sizeof(struct hffuse_page_desc) * ap->num_pages);
+	kfree(ap->pages);
+	ap->pages = pages;
 	ap->descs = descs;
-	data->max_folios = nfolios;
+	data->max_pages = npages;
 
 	return true;
 }
@@ -2260,16 +2208,17 @@ static void hffuse_writepages_send(struct hffuse_fill_wb_data *data)
 	struct hffuse_writepage_args *wpa = data->wpa;
 	struct inode *inode = data->inode;
 	struct hffuse_inode *fi = get_hffuse_inode(inode);
-	int num_folios = wpa->ia.ap.num_folios;
+	int num_pages = wpa->ia.ap.num_pages;
 	int i;
 
+	wpa->ia.ff = hffuse_file_get(data->ff);
 	spin_lock(&fi->lock);
 	list_add_tail(&wpa->queue_entry, &fi->queued_writes);
 	hffuse_flush_writepages(inode);
 	spin_unlock(&fi->lock);
 
-	for (i = 0; i < num_folios; i++)
-		folio_end_writeback(data->orig_folios[i]);
+	for (i = 0; i < num_pages; i++)
+		end_page_writeback(data->orig_pages[i]);
 }
 
 /*
@@ -2280,15 +2229,15 @@ static void hffuse_writepages_send(struct hffuse_fill_wb_data *data)
  * swapping the new temp page with the old one.
  */
 static bool hffuse_writepage_add(struct hffuse_writepage_args *new_wpa,
-			       struct folio *folio)
+			       struct page *page)
 {
 	struct hffuse_inode *fi = get_hffuse_inode(new_wpa->inode);
 	struct hffuse_writepage_args *tmp;
 	struct hffuse_writepage_args *old_wpa;
 	struct hffuse_args_pages *new_ap = &new_wpa->ia.ap;
 
-	WARN_ON(new_ap->num_folios != 0);
-	new_ap->num_folios = 1;
+	WARN_ON(new_ap->num_pages != 0);
+	new_ap->num_pages = 1;
 
 	spin_lock(&fi->lock);
 	old_wpa = hffuse_insert_writeback(&fi->writepages, new_wpa);
@@ -2302,9 +2251,9 @@ static bool hffuse_writepage_add(struct hffuse_writepage_args *new_wpa,
 
 		WARN_ON(tmp->inode != new_wpa->inode);
 		curr_index = tmp->ia.write.in.offset >> PAGE_SHIFT;
-		if (curr_index == folio->index) {
-			WARN_ON(tmp->ia.ap.num_folios != 1);
-			swap(tmp->ia.ap.folios[0], new_ap->folios[0]);
+		if (curr_index == page->index) {
+			WARN_ON(tmp->ia.ap.num_pages != 1);
+			swap(tmp->ia.ap.pages[0], new_ap->pages[0]);
 			break;
 		}
 	}
@@ -2317,19 +2266,22 @@ static bool hffuse_writepage_add(struct hffuse_writepage_args *new_wpa,
 	spin_unlock(&fi->lock);
 
 	if (tmp) {
-		hffuse_writepage_finish_stat(new_wpa->inode,
-					   folio);
+		struct backing_dev_info *bdi = inode_to_bdi(new_wpa->inode);
+
+		dec_wb_stat(&bdi->wb, WB_WRITEBACK);
+		dec_node_page_state(new_ap->pages[0], NR_WRITEBACK_TEMP);
+		wb_writeout_inc(&bdi->wb);
 		hffuse_writepage_free(new_wpa);
 	}
 
 	return false;
 }
 
-static bool hffuse_writepage_need_send(struct hffuse_conn *fc, struct folio *folio,
+static bool hffuse_writepage_need_send(struct hffuse_conn *fc, struct page *page,
 				     struct hffuse_args_pages *ap,
 				     struct hffuse_fill_wb_data *data)
 {
-	WARN_ON(!ap->num_folios);
+	WARN_ON(!ap->num_pages);
 
 	/*
 	 * Being under writeback is unlikely but possible.  For example direct
@@ -2337,23 +2289,27 @@ static bool hffuse_writepage_need_send(struct hffuse_conn *fc, struct folio *fol
 	 * the pages are faulted with get_user_pages(), and then after the read
 	 * completed.
 	 */
-	if (hffuse_folio_is_writeback(data->inode, folio))
+	if (hffuse_page_is_writeback(data->inode, page->index))
 		return true;
 
 	/* Reached max pages */
-	if (ap->num_folios == fc->max_pages)
+	if (ap->num_pages == fc->max_pages)
 		return true;
 
 	/* Reached max write bytes */
-	if ((ap->num_folios + 1) * PAGE_SIZE > fc->max_write)
+	if ((ap->num_pages + 1) * PAGE_SIZE > fc->max_write)
 		return true;
 
 	/* Discontinuity */
-	if (data->orig_folios[ap->num_folios - 1]->index + 1 != folio_index(folio))
+	if (data->orig_pages[ap->num_pages - 1]->index + 1 != page->index)
 		return true;
 
 	/* Need to grow the pages array?  If so, did the expansion fail? */
-	if (ap->num_folios == data->max_folios && !hffuse_pages_realloc(data))
+	if (ap->num_pages == data->max_pages && !hffuse_pages_realloc(data))
+		return true;
+
+	/* Reached alignment boundary */
+	if (fc->write_alignment && !(page->index % fc->write_align_pages))
 		return true;
 
 	return false;
@@ -2368,7 +2324,7 @@ static int hffuse_writepages_fill(struct folio *folio,
 	struct inode *inode = data->inode;
 	struct hffuse_inode *fi = get_hffuse_inode(inode);
 	struct hffuse_conn *fc = get_hffuse_conn(inode);
-	struct folio *tmp_folio;
+	struct page *tmp_page;
 	int err;
 
 	if (!data->ff) {
@@ -2378,14 +2334,14 @@ static int hffuse_writepages_fill(struct folio *folio,
 			goto out_unlock;
 	}
 
-	if (wpa && hffuse_writepage_need_send(fc, folio, ap, data)) {
+	if (wpa && hffuse_writepage_need_send(fc, &folio->page, ap, data)) {
 		hffuse_writepages_send(data);
 		data->wpa = NULL;
 	}
 
 	err = -ENOMEM;
-	tmp_folio = folio_alloc(GFP_NOFS | __GFP_HIGHMEM, 0);
-	if (!tmp_folio)
+	tmp_page = alloc_page(GFP_NOFS | __GFP_HIGHMEM);
+	if (!tmp_page)
 		goto out_unlock;
 
 	/*
@@ -2397,25 +2353,40 @@ static int hffuse_writepages_fill(struct folio *folio,
 	 * This is ensured by holding the page lock in page_mkwrite() while
 	 * checking hffuse_page_is_writeback().  We already hold the page lock
 	 * since clear_page_dirty_for_io() and keep it held until we add the
-	 * request to the fi->writepages list and increment ap->num_folios.
+	 * request to the fi->writepages list and increment ap->num_pages.
 	 * After this hffuse_page_is_writeback() will indicate that the page is
 	 * under writeback, so we can release the page lock.
 	 */
 	if (data->wpa == NULL) {
 		err = -ENOMEM;
-		wpa = hffuse_writepage_args_setup(folio, data->ff);
+		wpa = hffuse_writepage_args_alloc();
 		if (!wpa) {
-			folio_put(tmp_folio);
+			__free_page(tmp_page);
 			goto out_unlock;
 		}
-		hffuse_file_get(wpa->ia.ff);
-		data->max_folios = 1;
+		hffuse_writepage_add_to_bucket(fc, wpa);
+
+		data->max_pages = 1;
+
 		ap = &wpa->ia.ap;
+		hffuse_write_args_fill(&wpa->ia, data->ff, folio_pos(folio), 0);
+		wpa->ia.write.in.write_flags |= HFFUSE_WRITE_CACHE;
+		wpa->next = NULL;
+		ap->args.in_pages = true;
+		ap->args.end = hffuse_writepage_end;
+		ap->num_pages = 0;
+		wpa->inode = inode;
 	}
 	folio_start_writeback(folio);
 
-	hffuse_writepage_args_page_fill(wpa, folio, tmp_folio, ap->num_folios);
-	data->orig_folios[ap->num_folios] = folio;
+	copy_highpage(tmp_page, &folio->page);
+	ap->pages[ap->num_pages] = tmp_page;
+	ap->descs[ap->num_pages].offset = 0;
+	ap->descs[ap->num_pages].length = PAGE_SIZE;
+	data->orig_pages[ap->num_pages] = &folio->page;
+
+	inc_wb_stat(&inode_to_bdi(inode)->wb, WB_WRITEBACK);
+	inc_node_page_state(tmp_page, NR_WRITEBACK_TEMP);
 
 	err = 0;
 	if (data->wpa) {
@@ -2424,9 +2395,9 @@ static int hffuse_writepages_fill(struct folio *folio,
 		 * hffuse_page_is_writeback().
 		 */
 		spin_lock(&fi->lock);
-		ap->num_folios++;
+		ap->num_pages++;
 		spin_unlock(&fi->lock);
-	} else if (hffuse_writepage_add(wpa, folio)) {
+	} else if (hffuse_writepage_add(wpa, &folio->page)) {
 		data->wpa = wpa;
 	} else {
 		folio_end_writeback(folio);
@@ -2458,21 +2429,21 @@ static int hffuse_writepages(struct address_space *mapping,
 	data.ff = NULL;
 
 	err = -ENOMEM;
-	data.orig_folios = kcalloc(fc->max_pages,
-				   sizeof(struct folio *),
-				   GFP_NOFS);
-	if (!data.orig_folios)
+	data.orig_pages = kcalloc(fc->max_pages,
+				  sizeof(struct page *),
+				  GFP_NOFS);
+	if (!data.orig_pages)
 		goto out;
 
 	err = write_cache_pages(mapping, wbc, hffuse_writepages_fill, &data);
 	if (data.wpa) {
-		WARN_ON(!data.wpa->ia.ap.num_folios);
+		WARN_ON(!data.wpa->ia.ap.num_pages);
 		hffuse_writepages_send(&data);
 	}
 	if (data.ff)
 		hffuse_file_put(data.ff, false);
 
-	kfree(data.orig_folios);
+	kfree(data.orig_pages);
 out:
 	return err;
 }
@@ -2482,77 +2453,76 @@ out:
  * but how to implement it without killing performance need more thinking.
  */
 static int hffuse_write_begin(struct file *file, struct address_space *mapping,
-		loff_t pos, unsigned len, struct folio **foliop, void **fsdata)
+		loff_t pos, unsigned len, struct page **pagep, void **fsdata)
 {
 	pgoff_t index = pos >> PAGE_SHIFT;
 	struct hffuse_conn *fc = get_hffuse_conn(file_inode(file));
-	struct folio *folio;
+	struct page *page;
 	loff_t fsize;
 	int err = -ENOMEM;
 
 	WARN_ON(!fc->writeback_cache);
 
-	folio = __filemap_get_folio(mapping, index, FGP_WRITEBEGIN,
-			mapping_gfp_mask(mapping));
-	if (IS_ERR(folio))
+	page = grab_cache_page_write_begin(mapping, index);
+	if (!page)
 		goto error;
 
-	hffuse_wait_on_page_writeback(mapping->host, folio->index);
+	hffuse_wait_on_page_writeback(mapping->host, page->index);
 
-	if (folio_test_uptodate(folio) || len >= folio_size(folio))
+	if (PageUptodate(page) || len == PAGE_SIZE)
 		goto success;
 	/*
-	 * Check if the start of this folio comes after the end of file,
-	 * in which case the readpage can be optimized away.
+	 * Check if the start this page comes after the end of file, in which
+	 * case the readpage can be optimized away.
 	 */
 	fsize = i_size_read(mapping->host);
-	if (fsize <= folio_pos(folio)) {
-		size_t off = offset_in_folio(folio, pos);
+	if (fsize <= (pos & PAGE_MASK)) {
+		size_t off = pos & ~PAGE_MASK;
 		if (off)
-			folio_zero_segment(folio, 0, off);
+			zero_user_segment(page, 0, off);
 		goto success;
 	}
-	err = hffuse_do_readfolio(file, folio);
+	err = hffuse_do_readpage(file, page);
 	if (err)
 		goto cleanup;
 success:
-	*foliop = folio;
+	*pagep = page;
 	return 0;
 
 cleanup:
-	folio_unlock(folio);
-	folio_put(folio);
+	unlock_page(page);
+	put_page(page);
 error:
 	return err;
 }
 
 static int hffuse_write_end(struct file *file, struct address_space *mapping,
 		loff_t pos, unsigned len, unsigned copied,
-		struct folio *folio, void *fsdata)
+		struct page *page, void *fsdata)
 {
-	struct inode *inode = folio->mapping->host;
+	struct inode *inode = page->mapping->host;
 
 	/* Haven't copied anything?  Skip zeroing, size extending, dirtying. */
 	if (!copied)
 		goto unlock;
 
 	pos += copied;
-	if (!folio_test_uptodate(folio)) {
+	if (!PageUptodate(page)) {
 		/* Zero any unwritten bytes at the end of the page */
 		size_t endoff = pos & ~PAGE_MASK;
 		if (endoff)
-			folio_zero_segment(folio, endoff, PAGE_SIZE);
-		folio_mark_uptodate(folio);
+			zero_user_segment(page, endoff, PAGE_SIZE);
+		SetPageUptodate(page);
 	}
 
 	if (pos > inode->i_size)
 		i_size_write(inode, pos);
 
-	folio_mark_dirty(folio);
+	set_page_dirty(page);
 
 unlock:
-	folio_unlock(folio);
-	folio_put(folio);
+	unlock_page(page);
+	put_page(page);
 
 	return copied;
 }
@@ -2565,7 +2535,7 @@ static int hffuse_launder_folio(struct folio *folio)
 
 		/* Serialize with pending writeback for the same page */
 		hffuse_wait_on_page_writeback(inode, folio->index);
-		err = hffuse_writepage_locked(folio);
+		err = hffuse_writepage_locked(&folio->page);
 		if (!err)
 			hffuse_wait_on_page_writeback(inode, folio->index);
 	}
@@ -2601,17 +2571,17 @@ static void hffuse_vma_close(struct vm_area_struct *vma)
  */
 static vm_fault_t hffuse_page_mkwrite(struct vm_fault *vmf)
 {
-	struct folio *folio = page_folio(vmf->page);
+	struct page *page = vmf->page;
 	struct inode *inode = file_inode(vmf->vma->vm_file);
 
 	file_update_time(vmf->vma->vm_file);
-	folio_lock(folio);
-	if (folio->mapping != inode->i_mapping) {
-		folio_unlock(folio);
+	lock_page(page);
+	if (page->mapping != inode->i_mapping) {
+		unlock_page(page);
 		return VM_FAULT_NOPAGE;
 	}
 
-	hffuse_wait_on_folio_writeback(inode, folio);
+	hffuse_wait_on_page_writeback(inode, page->index);
 	return VM_FAULT_LOCKED;
 }
 
@@ -2704,14 +2674,14 @@ static int convert_hffuse_file_lock(struct hffuse_conn *fc,
 		 * translate it into the caller's pid namespace.
 		 */
 		rcu_read_lock();
-		fl->c.flc_pid = pid_nr_ns(find_pid_ns(ffl->pid, fc->pid_ns), &init_pid_ns);
+		fl->fl_pid = pid_nr_ns(find_pid_ns(ffl->pid, fc->pid_ns), &init_pid_ns);
 		rcu_read_unlock();
 		break;
 
 	default:
 		return -EIO;
 	}
-	fl->c.flc_type = ffl->type;
+	fl->fl_type = ffl->type;
 	return 0;
 }
 
@@ -2725,10 +2695,10 @@ static void hffuse_lk_fill(struct hffuse_args *args, struct file *file,
 
 	memset(inarg, 0, sizeof(*inarg));
 	inarg->fh = ff->fh;
-	inarg->owner = hffuse_lock_owner_id(fc, fl->c.flc_owner);
+	inarg->owner = hffuse_lock_owner_id(fc, fl->fl_owner);
 	inarg->lk.start = fl->fl_start;
 	inarg->lk.end = fl->fl_end;
-	inarg->lk.type = fl->c.flc_type;
+	inarg->lk.type = fl->fl_type;
 	inarg->lk.pid = pid;
 	if (flock)
 		inarg->lk_flags |= HFFUSE_LK_FLOCK;
@@ -2765,8 +2735,8 @@ static int hffuse_setlk(struct file *file, struct file_lock *fl, int flock)
 	struct hffuse_mount *fm = get_hffuse_mount(inode);
 	HFFUSE_ARGS(args);
 	struct hffuse_lk_in inarg;
-	int opcode = (fl->c.flc_flags & FL_SLEEP) ? HFFUSE_SETLKW : HFFUSE_SETLK;
-	struct pid *pid = fl->c.flc_type != F_UNLCK ? task_tgid(current) : NULL;
+	int opcode = (fl->fl_flags & FL_SLEEP) ? HFFUSE_SETLKW : HFFUSE_SETLK;
+	struct pid *pid = fl->fl_type != F_UNLCK ? task_tgid(current) : NULL;
 	pid_t pid_nr = pid_nr_ns(pid, fm->fc->pid_ns);
 	int err;
 
@@ -3062,7 +3032,7 @@ static void hffuse_do_truncate(struct file *file)
 	attr.ia_file = file;
 	attr.ia_valid |= ATTR_FILE;
 
-	hffuse_do_setattr(file_mnt_idmap(file), file_dentry(file), &attr, file);
+	hffuse_do_setattr(file_dentry(file), &attr, file);
 }
 
 static inline loff_t hffuse_round_up(struct hffuse_conn *fc, loff_t off)
@@ -3387,8 +3357,8 @@ static ssize_t hffuse_copy_file_range(struct file *src_file, loff_t src_off,
 				     len, flags);
 
 	if (ret == -EOPNOTSUPP || ret == -EXDEV)
-		ret = splice_copy_file_range(src_file, src_off, dst_file,
-					     dst_off, len);
+		ret = generic_copy_file_range(src_file, src_off, dst_file,
+					      dst_off, len, flags);
 	return ret;
 }
 
@@ -3416,10 +3386,10 @@ static const struct file_operations hffuse_file_operations = {
 static const struct address_space_operations hffuse_file_aops  = {
 	.read_folio	= hffuse_read_folio,
 	.readahead	= hffuse_readahead,
+	.writepage	= hffuse_writepage,
 	.writepages	= hffuse_writepages,
 	.launder_folio	= hffuse_launder_folio,
 	.dirty_folio	= filemap_dirty_folio,
-	.migrate_folio	= filemap_migrate_folio,
 	.bmap		= hffuse_bmap,
 	.direct_IO	= hffuse_direct_IO,
 	.write_begin	= hffuse_write_begin,

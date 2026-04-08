@@ -210,7 +210,7 @@ static const struct xattr_handler hffuse_xattr_handler = {
 	.set    = hffuse_xattr_set,
 };
 
-const struct xattr_handler * const hffuse_xattr_handlers[] = {
+const struct xattr_handler *hffuse_xattr_handlers[] = {
 	&hffuse_xattr_handler,
 	NULL
 };

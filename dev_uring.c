@@ -10,6 +10,7 @@
 
 #include <linux/fs.h>
 #include <linux/io_uring/cmd.h>
+#include <linux/io_uring_types.h>
 
 static bool __read_mostly enable_uring;
 module_param(enable_uring, bool, 0644);
@@ -61,14 +62,14 @@ static void hffuse_uring_flush_bg(struct hffuse_ring_queue *queue)
 	 * eliminates the need for remote queue wake-ups when global
 	 * limits are met but this queue has no more waiting requests.
 	 */
-	while ((fc->active_background < fc->max_background ||
+	while ((fc->active_background[DEFAULT_BG_QUEUE] < fc->max_background ||
 		!queue->active_background) &&
 	       (!list_empty(&queue->hffuse_req_bg_queue))) {
 		struct hffuse_req *req;
 
 		req = list_first_entry(&queue->hffuse_req_bg_queue,
 				       struct hffuse_req, list);
-		fc->active_background++;
+		fc->active_background[DEFAULT_BG_QUEUE]++;
 		queue->active_background++;
 
 		list_move_tail(&req->list, &queue->hffuse_req_queue);
@@ -211,7 +212,6 @@ static struct hffuse_ring *hffuse_uring_create(struct hffuse_conn *fc)
 	ring->nr_queues = nr_queues;
 	ring->fc = fc;
 	ring->max_payload_sz = max_payload_size;
-	atomic_set(&ring->queue_refs, 0);
 	smp_store_release(&fc->ring, ring);
 
 	spin_unlock(&fc->lock);

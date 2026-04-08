@@ -12,6 +12,8 @@
 #define HFFUSE_INT_REQ_BIT (1ULL << 0)
 #define HFFUSE_REQ_ID_STEP (1ULL << 1)
 
+#define DEFAULT_BG_QUEUE	READ
+
 struct hffuse_arg;
 struct hffuse_args;
 struct hffuse_pqueue;

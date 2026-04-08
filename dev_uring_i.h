@@ -173,12 +173,6 @@ static inline bool hffuse_uring_ready(struct hffuse_conn *fc)
 
 #else /* CONFIG_HFFUSE_IO_URING */
 
-struct hffuse_ring;
-
-static inline void hffuse_uring_create(struct hffuse_conn *fc)
-{
-}
-
 static inline void hffuse_uring_destruct(struct hffuse_conn *fc)
 {
 }
