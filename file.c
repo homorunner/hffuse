@@ -1470,6 +1470,10 @@ ssize_t hffuse_direct_io(struct hffuse_io_priv *io, struct iov_iter *iter,
 
 	max_pages = iov_iter_npages(iter, fc->max_pages);
 	ia = hffuse_io_alloc(io, max_pages);
+	while (!ia && max_pages > 0) {
+		max_pages /= 2;
+		ia = hffuse_io_alloc(io, max_pages);
+	}
 	if (!ia)
 		return -ENOMEM;
 
@@ -1538,6 +1542,10 @@ ssize_t hffuse_direct_io(struct hffuse_io_priv *io, struct iov_iter *iter,
 		if (count) {
 			max_pages = iov_iter_npages(iter, fc->max_pages);
 			ia = hffuse_io_alloc(io, max_pages);
+			while (!ia && max_pages > 0) {
+				max_pages /= 2;
+				ia = hffuse_io_alloc(io, max_pages);
+			}
 			if (!ia)
 				break;
 		}
